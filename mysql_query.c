@@ -4,7 +4,7 @@
  * 		Type handling for remote MySQL servers
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		mysql_query.c
@@ -63,7 +63,6 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 	Datum		valueDatum;
 	regproc		typeinput;
 	HeapTuple	tuple;
-	int			typemod;
 	char	   *str = palloc0(MAXDATELEN);
 	bytea	   *result;
 
@@ -73,7 +72,6 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 		elog(ERROR, "cache lookup failed for type%u", pgtyp);
 
 	typeinput = ((Form_pg_type) GETSTRUCT(tuple))->typinput;
-	typemod = ((Form_pg_type) GETSTRUCT(tuple))->typtypmod;
 	ReleaseSysCache(tuple);
 
 	switch (pgtyp)
@@ -86,13 +84,17 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 			 * in MySQL
 			 *
 			 * CREATE TABLE t (b BIT(8)); INSERT INTO t SET b = b'1001';
-			 * SELECT BIN(b) FROM t; +--------+ | BIN(b) | +--------+ | 1001 |
+			 * SELECT BIN(b) FROM t; 
+			 * +--------+ 
+			 * | BIN(b) | 
+			 * +--------+ 
+			 * | 1001 |
 			 * +--------+
 			 *
 			 * PostgreSQL expacts all binary data to be composed of either '0'
 			 * or '1'. MySQL gives value 9 hence PostgreSQL reports error. The
-			 * solution is to convert the decimal number into equivalent
-			 * binary string.
+			 * solution is to convert the decimal number into equivalent binary
+			 * string.
 			 * -----
 			 */
 		case BYTEAOID:
@@ -125,11 +127,23 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 
 					sprintf(str, "%s", dec_bin(value, 64));
 				}
-
-				/* Remove leading zero */
+				
+				/*
+				 * pgtypmod records type-specific data supplied at table creation time.
+				 * BIT(8)                         -> pgtypmod = 8
+				 * VARCHAR(12)                    -> pgtypmod = 12
+				 *  
+				 * The value will generally be -1 for types that do not need typmod.
+				 * BIT_OR, BIT_AND, TEXT, ...     -> pgtypmod = -1
+				 * 
+				 * Therefore, remove leading zero until to the pgtymod length.
+				 */
 				while (str[0] == '0')
+				{
+					if (pgtypmod != -1 && strlen(str) == pgtypmod)
+						break;
 					str++;
-
+				}
 				if (strcmp(str, "") == 0)
 					str[0] = '0';
 
@@ -142,7 +156,7 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 
 	value_datum = OidFunctionCall3(typeinput, valueDatum,
 								   ObjectIdGetDatum(pgtyp),
-								   Int32GetDatum(typemod));
+								   Int32GetDatum(pgtypmod));
 
 	return value_datum;
 }

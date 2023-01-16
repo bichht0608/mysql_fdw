@@ -4,7 +4,7 @@
  * 		FDW option handling for mysql_fdw
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		option.c
@@ -19,6 +19,7 @@
 #include "catalog/pg_user_mapping.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "mysql_fdw.h"
 #include "utils/lsyscache.h"
@@ -55,6 +56,8 @@ static struct MySQLFdwOption valid_options[] =
 	{"fetch_size", ForeignServerRelationId},
 	{"fetch_size", ForeignTableRelationId},
 	{"reconnect", ForeignServerRelationId},
+	{"character_set", ForeignServerRelationId},
+	{"sql_mode", ForeignServerRelationId},
 	{"use_remote_estimate", ForeignTableRelationId},
 	{"extensions", ForeignServerRelationId},
 	{"ssl_key", ForeignServerRelationId},
@@ -121,8 +124,9 @@ mysql_fdw_validator(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.len ? buf.data : "<none>")));
+					 buf.len > 0 ?
+					 errhint("Valid options in this context are: %s", buf.data) :
+					 errhint("There are no valid options in this context.")));
 		}
 
 		/* Validate fetch_size option value */
@@ -296,6 +300,12 @@ mysql_get_options(Oid foreignoid, bool is_foreigntable)
 
 		if (strcmp(def->defname, "reconnect") == 0)
 			opt->reconnect = defGetBoolean(def);
+		
+		if (strcmp(def->defname, "character_set") == 0)
+			opt->character_set = defGetString(def);
+
+		if (strcmp(def->defname, "sql_mode") == 0)
+			opt->sql_mode = defGetString(def);
 
 		if (strcmp(def->defname, "column_name") == 0)
 			opt->column_name = defGetString(def);
@@ -340,6 +350,17 @@ mysql_get_options(Oid foreignoid, bool is_foreigntable)
 	/* Default value for fetch_size */
 	if (!opt->fetch_size)
 		opt->fetch_size = MYSQL_PREFETCH_ROWS;
+
+	/* Default value for character_set */
+	if (!opt->character_set)
+		opt->character_set = MYSQL_AUTODETECT_CHARSET_NAME;
+	/* Special value provided for existing behavior */
+	else if (strcmp(opt->character_set, "PGDatabaseEncoding") == 0)
+		opt->character_set = (char *) GetDatabaseEncodingName();
+
+	/* Default value for sql_mode */
+	if (!opt->sql_mode)
+		opt->sql_mode = "ANSI_QUOTES";
 
 	return opt;
 }

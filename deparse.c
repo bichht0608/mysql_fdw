@@ -4,7 +4,7 @@
  * 		Query deparser for mysql_fdw
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		deparse.c
@@ -20,6 +20,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -43,6 +44,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "common/keywords.h"
 
 /* Return true if integer type */
 #define IS_INTEGER_TYPE(typid) ((typid == INT2OID) || (typid == INT4OID) || (typid == INT8OID))
@@ -199,6 +201,8 @@ static void mysql_append_limit_clause(deparse_expr_cxt *context);
 static void mysql_append_group_by_clause(List *tlist, deparse_expr_cxt *context);
 static void mysql_append_function_name(Oid funcid, deparse_expr_cxt *context);
 static void mysql_append_time_unit(Const *node, deparse_expr_cxt *context);
+static void mysql_append_order_by_suffix(Oid sortop, Oid sortcoltype, bool nulls_first,
+								deparse_expr_cxt *context);
 static void mysql_append_agg_order_by(List *orderList, List *targetList, deparse_expr_cxt *context);
 
 /*
@@ -288,7 +292,7 @@ static const char *MysqlUniqueJsonFunction[] = {
 	"json_type",
 	"json_unquote",
 	"json_valid",
-	"json_value",
+	"mysql_json_value",
 	"member_of",
 NULL};
 
@@ -303,7 +307,7 @@ static const char *MysqlUniqueStringFunction[] = {
 	"export_set",
 	"field",
 	"find_in_set",
-	"format",
+	"mysql_format",
 	"from_base64",
 	"hex",
 	"insert",
@@ -315,10 +319,10 @@ static const char *MysqlUniqueStringFunction[] = {
 	"oct",
 	"ord",
 	"quote",
-	"regexp_instr",
-	"regexp_like",
-	"regexp_replace",
-	"regexp_substr",
+	"mysql_regexp_instr",
+	"mysql_regexp_substr",
+	"mysql_regexp_replace",
+	"mysql_regexp_like",
 	"space",
 	"strcmp",
 	"substring_index",
@@ -501,7 +505,6 @@ static const char *MysqlSupportedBuiltinStringFunction[] = {
 	"rpad",
 	"rtrim",
 	"position",
-	"regexp_replace",
 	"substr",
 	"substring",
 	"trim",
@@ -1355,8 +1358,13 @@ mysql_deparse_from_expr(List *quals, deparse_expr_cxt *context)
 static void
 deparse_interval(StringInfo buf, Datum datum)
 {
+#if PG_VERSION_NUM >= 150000
+	struct pg_itm tm;
+	int64		fsec;
+#else
 	struct pg_tm tm;
 	fsec_t		fsec;
+#endif
 	bool		is_first = true;
 
 #define append_interval(expr, unit) \
@@ -1367,11 +1375,27 @@ do { \
 	is_first = false; \
 } while (0)
 
+#if PG_VERSION_NUM >= 150000
+#define append_long_interval(expr, unit) \
+do { \
+	if (!is_first) \
+		appendStringInfo(buf, " %s ", cur_opname); \
+	appendStringInfo(buf, "INTERVAL %ld %s", expr, unit); \
+	is_first = false; \
+} while (0)
+#endif
+
 	/* Check saved opname. It could be only "+" and "-" */
 	Assert(cur_opname);
 
+#if PG_VERSION_NUM >= 150000
+	interval2itm(*DatumGetIntervalP(datum), &tm);
+	fsec = tm.tm_usec;
+#else
 	if (interval2tm(*DatumGetIntervalP(datum), &tm, &fsec) != 0)
 		elog(ERROR, "could not convert interval to tm");
+#endif
+
 
 	if (tm.tm_year > 0)
 		append_interval(tm.tm_year, "YEAR");
@@ -1383,7 +1407,11 @@ do { \
 		append_interval(tm.tm_mday, "DAY");
 
 	if (tm.tm_hour > 0)
+#if PG_VERSION_NUM >= 150000
+		append_long_interval(tm.tm_hour, "HOUR");
+#else
 		append_interval(tm.tm_hour, "HOUR");
+#endif
 
 	if (tm.tm_min > 0)
 		append_interval(tm.tm_min, "MINUTE");
@@ -1396,7 +1424,11 @@ do { \
 		if (!is_first)
 			appendStringInfo(buf, " %s ", cur_opname);
 #ifdef HAVE_INT64_TIMESTAMP
+#if PG_VERSION_NUM >= 150000
+		appendStringInfo(buf, "INTERVAL %ld MICROSECOND", fsec);
+#else
 		appendStringInfo(buf, "INTERVAL %d MICROSECOND", fsec);
+#endif
 #else
 		appendStringInfo(buf, "INTERVAL %f MICROSECOND", fsec);
 #endif
@@ -1875,21 +1907,8 @@ mysql_deparse_param(Param *node, deparse_expr_cxt *context)
 	if (context->params_list)
 	{
 		int			pindex = 0;
-		ListCell   *lc;
 
-		/* Find its index in params_list */
-		foreach(lc, *context->params_list)
-		{
-			pindex++;
-			if (equal(node, (Node *) lfirst(lc)))
-				break;
-		}
-		if (lc == NULL)
-		{
-			/* Not in list, so add it */
-			pindex++;
-			*context->params_list = lappend(*context->params_list, node);
-		}
+		*context->params_list = lappend(*context->params_list, node);
 
 		mysql_print_remote_param(pindex, node->paramtype, node->paramtypmod,
 								 context);
@@ -1971,6 +1990,11 @@ mysql_replace_function(char *in, List *args)
 	if (has_mysql_prefix == true &&
 		(strcmp(in, "mysql_pi") == 0 ||
 		 strcmp(in, "mysql_char") == 0 ||
+		 strcmp(in, "mysql_format") == 0 ||
+		 strcmp(in, "mysql_regexp_instr") == 0 ||
+		 strcmp(in, "mysql_regexp_substr") == 0 ||
+		 strcmp(in, "mysql_regexp_replace") == 0 ||
+		 strcmp(in, "mysql_regexp_like") == 0 ||
 		 strcmp(in, "mysql_current_date") == 0 ||
 		 strcmp(in, "mysql_current_time") == 0 ||
 		 strcmp(in, "mysql_current_timestamp") == 0 ||
@@ -1980,6 +2004,7 @@ mysql_replace_function(char *in, List *args)
 		 strcmp(in, "mysql_now") == 0 ||
 		 strcmp(in, "mysql_time") == 0 ||
 		 strcmp(in, "mysql_timestamp") == 0 ||
+		 strcmp(in, "mysql_json_value") == 0 ||
 		 strcmp(in, "mysql_json_table") == 0))
 	{
 		in += strlen("mysql_");
@@ -2688,6 +2713,18 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	 */
 	if (node->funcformat == COERCE_IMPLICIT_CAST)
 	{
+		deparseExpr((Expr *) linitial(node->args), context);
+		return;
+	}
+
+	/* If the function call came from a cast, then show the first argument. */
+	if (node->funcformat == COERCE_EXPLICIT_CAST)
+	{
+		int32		coercedTypmod;
+
+		/* Get the typmod if this is a length-coercion function */
+		(void) exprIsLengthCoercion((Node *) node, &coercedTypmod);
+
 		deparseExpr((Expr *) linitial(node->args), context);
 		return;
 	}
@@ -3645,8 +3682,6 @@ mysql_append_agg_order_by(List *orderList, List *targetList, deparse_expr_cxt *c
 	{
 		SortGroupClause *srt = (SortGroupClause *) lfirst(lc);
 		Node	   *sortexpr;
-		Oid			sortcoltype;
-		TypeCacheEntry *typentry;
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
@@ -3654,29 +3689,10 @@ mysql_append_agg_order_by(List *orderList, List *targetList, deparse_expr_cxt *c
 
 		sortexpr = mysql_deparse_sort_group_clause(srt->tleSortGroupRef, targetList,
 												   false, context);
-		sortcoltype = exprType(sortexpr);
-		/* See whether operator is default < or > for datatype */
-		typentry = lookup_type_cache(sortcoltype,
-									 TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
-		if (srt->sortop == typentry->lt_opr)
-			appendStringInfoString(buf, " ASC");
-		else if (srt->sortop == typentry->gt_opr)
-			appendStringInfoString(buf, " DESC");
-		else
-		{
-			HeapTuple	opertup;
-			Form_pg_operator operform;
 
-			appendStringInfoString(buf, " USING ");
-
-			/* Append operator name. */
-			opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(srt->sortop));
-			if (!HeapTupleIsValid(opertup))
-				elog(ERROR, "cache lookup failed for operator %u", srt->sortop);
-			operform = (Form_pg_operator) GETSTRUCT(opertup);
-			mysql_deparse_operator_name(buf, operform);
-			ReleaseSysCache(opertup);
-		}
+		/* Add decoration as needed. */
+		mysql_append_order_by_suffix(srt->sortop, exprType(sortexpr), srt->nulls_first,
+							context);
 	}
 }
 
@@ -3729,6 +3745,41 @@ mysql_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
 }
 
 /*
+ * Append the ASC, DESC, USING <OPERATOR> and NULLS FIRST / NULLS LAST parts
+ * of an ORDER BY clause.
+ */
+static void
+mysql_append_order_by_suffix(Oid sortop, Oid sortcoltype, bool nulls_first,
+					deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	TypeCacheEntry *typentry;
+
+	/* See whether operator is default < or > for datatype */
+	typentry = lookup_type_cache(sortcoltype,
+									TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+	if (sortop == typentry->lt_opr)
+		appendStringInfoString(buf, " ASC");
+	else if (sortop == typentry->gt_opr)
+		appendStringInfoString(buf, " DESC");
+	else
+	{
+		HeapTuple	opertup;
+		Form_pg_operator operform;
+
+		appendStringInfoString(buf, " USING ");
+
+		/* Append operator name. */
+		opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(sortop));
+		if (!HeapTupleIsValid(opertup))
+			elog(ERROR, "cache lookup failed for operator %u", sortop);
+		operform = (Form_pg_operator) GETSTRUCT(opertup);
+		mysql_deparse_operator_name(buf, operform);
+		ReleaseSysCache(opertup);
+	}
+}
+
+/*
  * Print the representation of a parameter to be sent to the remote side.
  *
  * Note: we always label the Param's type explicitly rather than relying on
@@ -3775,7 +3826,7 @@ mysql_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
 bool
 mysql_is_builtin(Oid oid)
 {
-	return (oid < FirstBootstrapObjectId);
+	return (oid < FirstGenbkiObjectId);
 }
 
 /*
@@ -3895,6 +3946,22 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 		case T_Param:
 			{
 				Param	   *p = (Param *) node;
+
+				/*
+				 * If it's a MULTIEXPR Param, punt.  We can't tell from here
+				 * whether the referenced sublink/subplan contains any remote
+				 * Vars; if it does, handling that is too complicated to
+				 * consider supporting at present.  Fortunately, MULTIEXPR
+				 * Params are not reduced to plain PARAM_EXEC until the end of
+				 * planning, so we can easily detect this case.  (Normal
+				 * PARAM_EXEC Params are safe to ship because their values
+				 * come from somewhere else in the plan tree; but a MULTIEXPR
+				 * references a sub-select elsewhere in the same targetlist,
+				 * so we'd be on the hook to evaluate it somehow if we wanted
+				 * to handle such cases as direct foreign updates.)
+				 */
+				if (p->paramkind == PARAM_MULTIEXPR)
+					return false;
 
 				/*
 				 * boolean op_flag is used to check operator If value op_flag
@@ -4049,7 +4116,7 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				}
 
 				if (strcmp(funcname, "json_extract") == 0 ||
-					strcmp(funcname, "json_value") == 0 ||
+					strcmp(funcname, "mysql_json_value") == 0 ||
 					strcmp(funcname, "json_unquote") == 0 ||
 					strcmp(funcname, "convert") == 0)
 				{
@@ -4483,7 +4550,7 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 					func_name = get_func_name(fe->funcid);
 
 					if (!(strcmp(func_name, "json_extract") == 0 ||
-						  strcmp(func_name, "json_value") == 0 ||
+						  strcmp(func_name, "mysql_json_value") == 0 ||
 						  strcmp(func_name, "json_unquote") == 0 ||
 						  strcmp(func_name, "convert") == 0))
 						return false;
@@ -5481,8 +5548,7 @@ mysql_append_order_by_clause(List *pathkeys, bool has_final_sort,
 							 deparse_expr_cxt *context)
 {
 	ListCell   *lcell;
-	char	   *delim = " ";
-	RelOptInfo *baserel = context->scanrel;
+	const char	   *delim = " ";
 	StringInfo	buf = context->buf;
 
 	/* Make sure any constants in the exprs are printed portably */
@@ -5492,6 +5558,8 @@ mysql_append_order_by_clause(List *pathkeys, bool has_final_sort,
 	{
 		PathKey    *pathkey = lfirst(lcell);
 		Expr	   *em_expr;
+		EquivalenceMember *em;
+		Oid			oprid;
 
 		if (has_final_sort)
 		{
@@ -5499,14 +5567,38 @@ mysql_append_order_by_clause(List *pathkeys, bool has_final_sort,
 			 * By construction, context->foreignrel is the input relation to
 			 * the final sort.
 			 */
-			em_expr = mysql_find_em_expr_for_input_target(context->root,
-														  pathkey->pk_eclass,
-														  context->foreignrel->reltarget);
+			em = mysql_find_em_for_rel_target(context->root,
+											  pathkey->pk_eclass,
+											  context->foreignrel);
 		}
 		else
-			em_expr = mysql_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+			em = mysql_find_em_for_rel(context->root,
+									   pathkey->pk_eclass,
+									   context->scanrel);
 
-		Assert(em_expr != NULL);
+		/*
+		 * We don't expect any error here; it would mean that shippability
+		 * wasn't verified earlier.  For the same reason, we don't recheck
+		 * shippability of the sort operator.
+		 */
+		if (em == NULL)
+			elog(ERROR, "could not find pathkey item to sort");
+
+		em_expr = em->em_expr;
+
+		/*
+		 * Lookup the operator corresponding to the strategy in the opclass.
+		 * The datatype used by the opfamily is not necessarily the same as
+		 * the expression type (for array types for example).
+		 */
+		oprid = get_opfamily_member(pathkey->pk_opfamily,
+									em->em_datatype,
+									em->em_datatype,
+									pathkey->pk_strategy);
+		if (!OidIsValid(oprid))
+			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+				 pathkey->pk_strategy, em->em_datatype, em->em_datatype,
+				 pathkey->pk_opfamily);
 
 		appendStringInfoString(buf, delim);
 		deparseExpr(em_expr, context);
@@ -5525,7 +5617,6 @@ mysql_append_order_by_clause(List *pathkeys, bool has_final_sort,
 			appendStringInfoString(buf, " ASC");
 		else
 			appendStringInfoString(buf, " DESC");
-
 	}
 }
 
@@ -5552,14 +5643,65 @@ mysql_append_limit_clause(deparse_expr_cxt *context)
 }
 
 /*
- * Find an equivalence class member expression to be computed as a sort column
- * in the given target.
+ * Given an EquivalenceClass and a foreign relation, find an EC member
+ * that can be used to sort the relation remotely according to a pathkey
+ * using this EC.
+ *
+ * If there is more than one suitable candidate, return an arbitrary
+ * one of them.  If there is none, return NULL.
+ *
+ * This checks that the EC member expression uses only Vars from the given
+ * rel and is shippable.  Caller must separately verify that the pathkey's
+ * ordering operator is shippable.
  */
-Expr *
-mysql_find_em_expr_for_input_target(PlannerInfo *root,
-									EquivalenceClass *ec,
-									PathTarget *target)
+EquivalenceMember *
+mysql_find_em_for_rel(PlannerInfo *root, EquivalenceClass *ec, RelOptInfo *rel)
 {
+	ListCell   *lc;
+
+	foreach(lc, ec->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+
+		/* ignore this check for volatile stub function */
+		if (IsA(em->em_expr, FuncExpr))
+		{
+			FuncExpr   *fe = (FuncExpr *) em->em_expr;
+
+			if (!mysql_is_builtin(fe->funcid) &&
+				contain_volatile_functions((Node *) fe))
+				return em;
+		}
+
+		/*
+		 * Note we require !bms_is_empty, else we'd accept constant
+		 * expressions which are not suitable for the purpose.
+		 */
+		if (bms_is_subset(em->em_relids, rel->relids) &&
+			!bms_is_empty(em->em_relids) &&
+			mysql_is_foreign_expr(root, rel, em->em_expr))
+			return em;
+	}
+
+	return NULL;
+}
+
+/*
+ * Find an EquivalenceClass member that is to be computed as a sort column
+ * in the given rel's reltarget, and is shippable.
+ *
+ * If there is more than one suitable candidate, return an arbitrary
+ * one of them.  If there is none, return NULL.
+ *
+ * This checks that the EC member expression uses only Vars from the given
+ * rel and is shippable.  Caller must separately verify that the pathkey's
+ * ordering operator is shippable.
+ */
+EquivalenceMember *
+mysql_find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
+					   RelOptInfo *rel)
+{
+	PathTarget *target = rel->reltarget;
 	ListCell   *lc1;
 	int			i;
 
@@ -5602,15 +5744,18 @@ mysql_find_em_expr_for_input_target(PlannerInfo *root,
 			while (em_expr && IsA(em_expr, RelabelType))
 				em_expr = ((RelabelType *) em_expr)->arg;
 
-			if (equal(em_expr, expr))
-				return em->em_expr;
+			if (!equal(em_expr, expr))
+				continue;
+
+			/* Check that expression (including relabels!) is shippable */
+			if (mysql_is_foreign_expr(root, rel, em->em_expr))
+				return em;
 		}
 
 		i++;
 	}
 
-	elog(ERROR, "could not find pathkey item to sort");
-	return NULL;				/* keep compiler quiet */
+	return NULL;
 }
 
 /*
@@ -5796,12 +5941,22 @@ mysql_append_function_name(Oid funcid, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	char	   *proname;
+	int			kwnum = 0;
 
 	/* Always print the function name */
 	proname = get_func_name(funcid);
 	proname = mysql_replace_function(proname, NIL);
 
-	appendStringInfoString(buf, quote_identifier(proname));
+	/* Check for keyword. We quote keywords except for the keyword
+	 * in keyword lists (kwkist.h). Because some function names
+	 * coincide with the keyword lists, these no need to quote.
+	 */
+	kwnum = ScanKeywordLookup(proname, &ScanKeywords);
+
+	if (kwnum >= 0)
+		appendStringInfoString(buf, proname);
+	else
+		appendStringInfoString(buf, quote_identifier(proname));
 }
 
 /*
@@ -5906,11 +6061,19 @@ starts_with(const char *pre, const char *str)
 static void
 interval2unit(Datum datum, char **expr, char **unit)
 {
+#if PG_VERSION_NUM >= 150000
+	struct pg_itm tm;
+	int64		fsec;
+
+	interval2itm(*DatumGetIntervalP(datum), &tm);
+	fsec = tm.tm_usec;
+#else
 	struct pg_tm tm;
 	fsec_t		fsec;
 
 	if (interval2tm(*DatumGetIntervalP(datum), &tm, &fsec) != 0)
 		elog(ERROR, "mysql_fdw: could not convert interval to tm");
+#endif
 
 	if (*unit == NULL)
 	{
@@ -5923,7 +6086,11 @@ interval2unit(Datum datum, char **expr, char **unit)
 			int			mday = tm.tm_year * DAYS_PER_YEAR + tm.tm_mon * DAYS_PER_MONTH + tm.tm_mday;
 
 			/* DAYS HOURS:MINUTES:SECONDS.MICROSECONDS */
+#if PG_VERSION_NUM >= 150000
+			*expr = psprintf("%d %ld:%d:%d.%ld", mday, tm.tm_hour, tm.tm_min, tm.tm_sec, fsec);
+#else
 			*expr = psprintf("%d %d:%d:%d.%d", mday, tm.tm_hour, tm.tm_min, tm.tm_sec, fsec);
+#endif
 			*unit = "DAY_MICROSECOND";
 		}
 		else if (tm.tm_mon != 0)
@@ -5956,6 +6123,25 @@ interval2unit(Datum datum, char **expr, char **unit)
 
 		*expr = psprintf("%lu.%d", sec, microsecond);
 	}
+}
+
+/*
+ * Returns true if it's safe to push down the sort expression described by
+ * 'pathkey' to the foreign server.
+ */
+bool
+mysql_is_foreign_pathkey(PlannerInfo *root,
+				   RelOptInfo *baserel,
+				   PathKey *pathkey)
+{
+	EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
+
+	/* can't push down the sort if the pathkey's opfamily is not built-in */
+	if (!mysql_is_builtin(pathkey->pk_opfamily))
+		return false;
+
+	/* can push if a suitable EC member exists */
+	return (mysql_find_em_for_rel(root, pathkey_ec, baserel) != NULL);
 }
 
 /*

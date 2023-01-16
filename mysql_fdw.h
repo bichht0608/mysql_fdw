@@ -4,7 +4,7 @@
  * 		Foreign-data wrapper for remote MySQL servers
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		mysql_fdw.h
@@ -221,6 +221,8 @@ typedef struct mysql_opt
 	bool		use_remote_estimate;	/* use remote estimate for rows */
 	unsigned long fetch_size;	/* Number of rows to fetch from remote server */
 	bool		reconnect;		/* set to true for automatic reconnection */
+	char	   *character_set;	/* Character set used for remote connection */
+	char	   *sql_mode;		/* MySQL sql_mode variable for connection */
 
 	char	   *column_name;	/* use column name option */
 
@@ -500,15 +502,21 @@ extern bool mysql_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel,
 extern bool mysql_is_foreign_param(PlannerInfo *root,
 								   RelOptInfo *baserel,
 								   Expr *expr);
+extern bool mysql_is_foreign_pathkey(PlannerInfo *root,
+							   RelOptInfo *baserel,
+							   PathKey *pathkey);
 extern const char *mysql_get_jointype_name(JoinType jointype);
 extern void mysql_classify_conditions(PlannerInfo *root,
 									  RelOptInfo *baserel,
 									  List *input_conds,
 									  List **remote_conds,
 									  List **local_conds);
-extern Expr *mysql_find_em_expr_for_input_target(PlannerInfo *root,
+extern EquivalenceMember *mysql_find_em_for_rel(PlannerInfo *root,
+										  EquivalenceClass *ec,
+										  RelOptInfo *rel);
+extern EquivalenceMember *mysql_find_em_for_rel_target(PlannerInfo *root,
 												 EquivalenceClass *ec,
-												 PathTarget *target);
+												 RelOptInfo *rel);
 extern List *mysql_build_tlist_to_deparse(RelOptInfo *foreignrel);
 
 extern Expr *mysql_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);

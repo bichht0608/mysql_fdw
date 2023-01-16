@@ -122,7 +122,7 @@ abs, acos, asin, atan, atan2, ceil, ceiling, cos, cot, degrees, div, exp, floor,
 ln, log, log10, mod, pow, power, radians, round, sign, sin, sqrt, tan.
 ascii, bit_length, char_length, character_length, concat, concat_ws, left,
 length, lower, lpad, ltrim, octet_length, repeat, replace, reverse, right,
-rpad, rtrim, position, regexp_replace, substr, substring, trim, upper.
+rpad, rtrim, position, substr, substring, trim, upper.
 date.
 json_build_array, json_build_object.
 ```
@@ -136,8 +136,8 @@ conv, crc32, div, log2, rand, truncate.
 String:
 ```
 bin, char, elt, export_set, field, find_in_set, format, from_base64, hex, insert,
-instr, lcase,locate, make_set, mid, oct, ord, quote, regexp_instr, regexp_like,
-regexp_replace, regexp_substr,space, strcmp, substring_index, to_base64, ucase,
+instr, lcase,locate, make_set, mid, oct, ord, quote, regexp_like, regexp_instr,
+regexp_substr, regexp_replace, space, strcmp, substring_index, to_base64, ucase,
 unhex, weight_string.
 ```
 Json:
@@ -158,7 +158,7 @@ List of unique functions of Mysql with different name and syntax:
   - MATCH ... AGAINST ...: `match_against`   
   Example: SELECT content FROM contents WHERE match_against(content, 'search_keyword','in boolean mode') != 0;
   - Prefix name with `mysql_`:   
-  User needs to append prefix with `mysql_` for function name: pi, char, now, current_date, current_time, current_timestamp, extract, localtime, localtimestamp, time, timestamp.   
+  User needs to append prefix with `mysql_` for function name: pi, char, now, format, regexp_like, regexp_instr, regexp_substr, regexp_replace, current_date, current_time, current_timestamp, extract, localtime, localtimestamp, time, timestamp, json_table, json_value.    
   Example: pi() -> mysql_pi()
   - WEIGHT_STRING(str [AS {CHAR|BINARY} (N)]):   
   Example: SELECT str1 FROM s3 WHERE weight_string(str1, 'CHAR', 3) > 0 AND weight_string(str1, 'BINARY', 5) > 1;
@@ -201,14 +201,14 @@ SEMI, and ANTI join. This is a performance feature.
 - Support discard cached connections to remote servers by using function mysql_fdw_disconnect(), mysql_fdw_disconnect_all().
 - Support bulk insert by using batch_size option.
 - Whole row reference is implemented by modifying the target list to select all whole row reference members and form new row for the whole row in FDW when interate foreign scan.
-- Support returning system attribute (`ctid`, `tableiod`)
+- Support returning system attribute (`ctid`, `tableiod`).
+- Support ON CONFLICT DO NOTHING.
 
 ### Prepared Statement
 (Refactoring for `select` queries to use prepared statement)
 
 The `select` queries are now using prepared statements instead of simple
 query protocol.
-
 
 Usage
 -----
@@ -227,6 +227,8 @@ The following parameters can be set on a MySQL foreign server object:
   * `reconnect`: Enable or disable automatic reconnection to the
     MySQL server if the existing connection is found to have been lost.
     Default is `false`.
+  * `sql_mode`: Set MySQL sql_mode for established connection. Default
+    is `ANSI_QUOTES`.
   * `ssl_key`: The path name of the client private key file.
   * `ssl_cert`: The path name of the client public key certificate file.
   * `ssl_ca`: The path name of the Certificate Authority (CA) certificate
@@ -239,6 +241,11 @@ The following parameters can be set on a MySQL foreign server object:
     get in each fetch operation. It can be specified for a foreign table or
     a foreign server. The option specified on a table overrides an option
     specified for the server. The default is `100`.
+  * `character_set`: The character set to use for MySQL connection. Default
+    is `auto` which means autodetect based on the operating system setting.
+    Before the introduction of the character_set option, the character set
+    was set similar to the PostgreSQL database encoding. To get this older
+    behavior set the character_set to special value `PGDatabaseEncoding`.
 
 The following parameters can be set on a MySQL foreign table object:
 
@@ -253,6 +260,21 @@ The following parameters need to supplied while creating user mapping.
 
   * `username`: Username to use when connecting to MySQL.
   * `password`: Password to authenticate to the MySQL server with.
+
+The following parameters can be set on IMPORT FOREIGN SCHEMA command:
+
+  * `import_default`: This option controls whether column DEFAULT
+  expressions are included in the definitions of foreign tables imported
+  from a foreign server. The default is `false`.
+  * `import_not_null`: This option controls whether column NOT NULL
+  constraints are included in the definitions of foreign tables imported
+  from a foreign server. The default is `true`.
+  * `import_enum_as_text`: This option can be used to map MySQL ENUM type
+  to TEXT type in the definitions of foreign tables, otherwise emit a
+  warning for type to be created. The default is `false`.
+
+The following parameters can be set on a MySQL attribute object:
+  * `key`: This option specify whether a column is used as primary key.
 
 Examples
 --------
@@ -314,6 +336,13 @@ Limit  (cost=10.00..11.00 rows=1 width=36)
 		Remote query: SELECT `warehouse_id`, `warehouse_name` FROM `db`.`warehouse` WHERE ((`warehouse_name` LIKE BINARY 'TV'))
 ```
 
+Limitation
+------------
+- group_concat: multiple arguments cannot combined with aggregate(ORDER BY).
+- ANY ARRAY: not support pushdown when operator different =, <> or right operand like sub-query.
+- MySQL stores floating-point numbers as approximate and not exact values. Therefore, comparing equality with floating-point numbers may lead to incorrect result. 
+- From MySQL version 8.0.31, if we insert 'infinity' and then select var_pop of it, MySQL FDW returns out of range error.
+
 Contributing
 ------------
 Opening issues and pull requests on GitHub are welcome.
@@ -322,7 +351,7 @@ License
 -------
 Copyright (c) 2021, TOSHIBA Corporation.
 
-Copyright (c) 2011-2021, EnterpriseDB Corporation.
+Copyright (c) 2011-2022, EnterpriseDB Corporation.
 
 Permission to use, copy, modify, and distribute this software and its
 documentation for any purpose, without fee, and without a written

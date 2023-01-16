@@ -7,8 +7,8 @@ mysql -uroot -p$MYSQL_ROOT_PASS -e "SET GLOBAL local_infile=1;"
 
 ./mysql_init.sh
 
-sed -i 's/REGRESS =.*/REGRESS = mysql_fdw server_options connection_validation dml select pushdown selectfunc mysql_fdw_post join_pushdown extra\/aggregates/' Makefile
+sed -i 's/REGRESS =.*/REGRESS = mysql_fdw server_options connection_validation dml select pushdown selectfunc mysql_fdw_post join_pushdown aggregate_pushdown extra\/aggregates/' Makefile
 
 make clean
-make
-make check | tee make_check.out
+make $1
+make check $1 | tee make_check.out
