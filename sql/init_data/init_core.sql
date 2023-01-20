@@ -48,6 +48,8 @@ DROP TABLE IF EXISTS `agg_t7`;
 DROP TABLE IF EXISTS `agg_t8`;
 DROP TABLE IF EXISTS `agg_t9`;
 DROP TABLE IF EXISTS `aggtest`;
+DROP TABLE IF EXISTS `btgtest`;
+DROP TABLE IF EXISTS `btg`;
 DROP TABLE IF EXISTS `b1`;
 DROP TABLE IF EXISTS `b2`;
 DROP TABLE IF EXISTS `b3`;
@@ -138,6 +140,8 @@ DROP TABLE IF EXISTS `zt2`;
 DROP TABLE IF EXISTS `zt3`;
 SET FOREIGN_KEY_CHECKS = 1;
 
+CREATE TABLE btgtest(id int primary key, p int, c float, d float, e float);
+CREATE TABLE btg(id int primary key, p int, v text, c float, d float, e float);
 CREATE TABLE FLOAT4_TBL (f1  REAL);
 CREATE TABLE FLOAT4_TMP (f1  REAL, id integer primary key auto_increment);
 CREATE TABLE FLOAT8_TBL(f1 DOUBLE PRECISION);

@@ -4,7 +4,7 @@
  * 		Foreign-data wrapper for remote MySQL servers
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		mysql_fdw.c
@@ -136,9 +136,9 @@ uint64_t	((mysql_stmt_affected_rows) (MYSQL_STMT * stmt));
 
 /*
  * In PG 9.5.1 the number will be 90501,
- * our version is 2.6.1 so number will be 20601
+ * our version is 2.8.0 so number will be 20800
  */
-#define CODE_VERSION   20602
+#define CODE_VERSION   20800
 
 /* Struct for extra information passed to estimate_path_cost_size() */
 typedef struct
@@ -160,9 +160,9 @@ typedef struct
  */
 enum FdwPathPrivateIndex
 {
-	/* has-final-sort flag (as an integer Value node) */
+	/* has-final-sort flag (as a Boolean node) */
 	FdwPathPrivateHasFinalSort,
-	/* has-limit flag (as an integer Value node) */
+	/* has-limit flag (as a Boolean node) */
 	FdwPathPrivateHasLimit
 };
 
@@ -228,7 +228,7 @@ enum FdwModifyPrivateIndex
 	FdwModifyPrivateTargetAttnums,
 	/* Length till the end of VALUES clause (as an integer Value node) */
 	FdwModifyPrivateValuesEndLen,
-	/* has-returning flag (as an integer Value node) */
+	/* has-returning flag (as a Boolean node) */
 	FdwModifyPrivateHasReturning,
 	/* Integer list of attribute numbers retrieved by RETURNING */
 	FdwModifyPrivateRetrievedAttrs
@@ -247,11 +247,11 @@ enum FdwDirectModifyPrivateIndex
 {
 	/* SQL statement to execute remotely (as a String node) */
 	FdwDirectModifyPrivateUpdateSql,
-	/* has-returning flag (as an integer Value node) */
+	/* has-returning flag (as a Boolean node) */
 	FdwDirectModifyPrivateHasReturning,
 	/* Integer list of attribute numbers retrieved by RETURNING */
 	FdwDirectModifyPrivateRetrievedAttrs,
-	/* set-processed flag (as an integer Value node) */
+	/* set-processed flag (as a Boolean node) */
 	FdwDirectModifyPrivateSetProcessed
 };
 
@@ -883,6 +883,9 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	mysql_stmt_attr_set(festate->stmt, STMT_ATTR_PREFETCH_ROWS,
 						(void *) &options->fetch_size);
 
+	if (tupleDescriptor->natts == 0)
+		return;
+
 	festate->table = (mysql_table *) palloc0(sizeof(mysql_table));
 	festate->table->column = (mysql_column *) palloc0(sizeof(mysql_column) * tupleDescriptor->natts);
 	festate->table->mysql_bind = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * tupleDescriptor->natts);
@@ -1154,6 +1157,7 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	const char *database;
 	const char *relname;
 	const char *refname;
+	char		sql_mode[255];
 
 	fpinfo = (MySQLFdwRelationInfo *) palloc0(sizeof(MySQLFdwRelationInfo));
 	baserel->fdw_private = (void *) fpinfo;
@@ -1168,7 +1172,10 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	/* Connect to the server */
 	conn = mysql_get_connection(server, user, options);
 
-	mysql_query(conn, "SET sql_mode='ANSI_QUOTES'");
+	snprintf(sql_mode, sizeof(sql_mode), "SET sql_mode = '%s'",
+			 options->sql_mode);
+	if (mysql_query(conn, sql_mode) != 0)
+		mysql_error_print(conn);
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
@@ -1682,10 +1689,17 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	 */
 	if (best_path->fdw_private)
 	{
+#if PG_VERSION_NUM >= 150000
+		has_final_sort = boolVal(list_nth(best_path->fdw_private,
+										  FdwPathPrivateHasFinalSort));
+		has_limit = boolVal(list_nth(best_path->fdw_private,
+									 FdwPathPrivateHasLimit));
+#else
 		has_final_sort = intVal(list_nth(best_path->fdw_private,
 										 FdwPathPrivateHasFinalSort));
 		has_limit = intVal(list_nth(best_path->fdw_private,
 									FdwPathPrivateHasLimit));
+#endif
 	}
 
 	/*
@@ -1927,7 +1941,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 
 	fdw_private = list_make2(makeString(sql.data), retrieved_attrs);
 
-	if (IS_JOIN_REL(foreignrel))
+	if ((IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel)))
 	{
 		fdw_private = lappend(fdw_private,
 							  makeString(fpinfo->relation_name->data));
@@ -2339,24 +2353,31 @@ mysql_execute_foreign_insert(EState *estate,
 	MySQLFdwExecState *fmstate;
 	MYSQL_BIND *mysql_bind_buffer;
 	ListCell   *lc;
-	int			n_params;
+	int		    n_params;
 	MemoryContext oldcontext;
 	bool	   *isnull;
+	char	    sql_mode[255];
+	Oid		    foreignTableId = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 #if PG_VERSION_NUM >= 140000
 	StringInfoData sql;
 #endif
-	int			i;
-	int			bindnum = 0;
+	int		    i;
+	int		    bindnum = 0;
 
 	fmstate = (MySQLFdwExecState *) resultRelInfo->ri_FdwState;
 	n_params = list_length(fmstate->retrieved_attrs);
+
+	fmstate->mysqlFdwOptions = mysql_get_options(foreignTableId, true);
 
 	oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
 
 	mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * n_params * *numSlots);
 	isnull = (bool *) palloc0(sizeof(bool) * n_params * *numSlots);
 
-	mysql_query(fmstate->conn, "SET sql_mode='ANSI_QUOTES'");
+	snprintf(sql_mode, sizeof(sql_mode), "SET sql_mode = '%s'",
+			 fmstate->mysqlFdwOptions->sql_mode);
+	if (mysql_query(fmstate->conn, sql_mode) != 0)
+		mysql_error_print(fmstate->conn);
 
 #if PG_VERSION_NUM >= 140000
 	if (fmstate->num_slots != *numSlots)
@@ -2482,8 +2503,8 @@ mysqlExecForeignBatchInsert(EState *estate,
  *		Determine the maximum number of tuples that can be inserted in bulk
  *
  * Returns the batch size specified for server or table. When batching is not
- * allowed (e.g. for tables with AFTER ROW triggers or with RETURNING clause),
- * returns 1.
+ * allowed (e.g. for tables with BEFORE/AFTER ROW triggers or with RETURNING
+ * clause), returns 1.
  */
 static int
 mysqlGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
@@ -2505,6 +2526,22 @@ mysqlGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 		batch_size = fmstate->batch_size;
 	else
 		batch_size = get_batch_size_option(resultRelInfo->ri_RelationDesc);
+
+	/*
+	 * Disable batching when there are any BEFORE/AFTER ROW
+	 * INSERT triggers on the foreign table, or there are any
+	 * WITH CHECK OPTION constraints from parent views.
+	 *
+	 * When there are any BEFORE ROW INSERT triggers on the table, we can't
+	 * support it, because such triggers might query the table we're inserting
+	 * into and act differently if the tuples that have already been processed
+	 * and prepared for insertion are not there.
+	 */
+	if (resultRelInfo->ri_WithCheckOptions != NIL ||
+		(resultRelInfo->ri_TrigDesc &&
+		 (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+		  resultRelInfo->ri_TrigDesc->trig_insert_after_row)))
+		return 1;
 
 	/*
 	 * Otherwise use the batch size specified for server/table. The number of
@@ -3069,10 +3106,15 @@ mysqlPlanDirectModify(PlannerInfo *root,
 	 * Items in the list must match enum FdwDirectModifyPrivateIndex, above.
 	 */
 	fscan->fdw_private = list_make4(makeString(sql.data),
+#if PG_VERSION_NUM >= 150000
+									makeBoolean((retrieved_attrs != NIL)),
+									retrieved_attrs,
+									makeBoolean(plan->canSetTag));
+#else
 									makeInteger(0),
 									retrieved_attrs,
 									makeInteger(plan->canSetTag));
-
+#endif
 	/*
 	 * Update the foreign-join-related fields.
 	 */
@@ -3173,12 +3215,19 @@ mysqlBeginDirectModify(ForeignScanState *node, int eflags)
 	/* Get private info created by planner functions. */
 	dmstate->query = strVal(list_nth(fsplan->fdw_private,
 									 FdwDirectModifyPrivateUpdateSql));
+#if PG_VERSION_NUM >= 150000
+	dmstate->has_returning = boolVal(list_nth(fsplan->fdw_private,
+											  FdwDirectModifyPrivateHasReturning));
+	dmstate->set_processed = boolVal(list_nth(fsplan->fdw_private,
+											  FdwDirectModifyPrivateSetProcessed));
+#else
 	dmstate->has_returning = intVal(list_nth(fsplan->fdw_private,
 											 FdwDirectModifyPrivateHasReturning));
-	dmstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
-												 FdwDirectModifyPrivateRetrievedAttrs);
 	dmstate->set_processed = intVal(list_nth(fsplan->fdw_private,
 											 FdwDirectModifyPrivateSetProcessed));
+#endif
+	dmstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
+												 FdwDirectModifyPrivateRetrievedAttrs);
 
 	/* Create context for per-tuple temp workspace. */
 	dmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -3421,6 +3470,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	List	   *commands = NIL;
 	bool		import_default = false;
 	bool		import_not_null = true;
+	bool		import_enum_as_text = false;
 #if PG_VERSION_NUM >= 140000
 	bool		import_generated = true;
 #endif
@@ -3442,6 +3492,8 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			import_default = defGetBoolean(def);
 		else if (strcmp(def->defname, "import_not_null") == 0)
 			import_not_null = defGetBoolean(def);
+		else if (strcmp(def->defname, "import_enum_as_text") == 0)
+			import_enum_as_text = defGetBoolean(def);
 #if PG_VERSION_NUM >= 140000
 		else if (strcmp(def->defname, "import_generated") == 0)
 			import_generated = defGetBoolean(def);
@@ -3571,6 +3623,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	{
 		char	   *tablename = row[0];
 		bool		first_item = true;
+		bool		has_set = false;
 
 		resetStringInfo(&buf);
 		appendStringInfo(&buf, "CREATE FOREIGN TABLE %s (\n",
@@ -3588,8 +3641,12 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			char	   *attgenerated;
 #endif
 
-			/* If table has no columns, we'll see nulls here */
-			if (row[1] == NULL)
+			/*
+			 * If the table has no columns, we'll see nulls here. Also, if we
+			 * have already discovered this table has a SET type column, we
+			 * better skip the rest of the checking.
+			 */
+			if (row[1] == NULL || has_set)
 				continue;
 
 			attname = row[1];
@@ -3606,10 +3663,35 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 #endif
 
 			if (strncmp(typedfn, "enum(", 5) == 0)
-				ereport(NOTICE,
-						(errmsg("error while generating the table definition"),
-						 errhint("If you encounter an error, you may need to execute the following first:\nDO $$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type WHERE typname = '%s') THEN CREATE TYPE %s AS %s; END IF; END$$;\n",
-								 typename, typename, typedfn)));
+			{
+				/*
+				 * If import_enum_as_text is set, then map MySQL enum type to
+				 * text while import, else emit a warning to create mapping
+				 * TYPE.
+				 */
+				if (import_enum_as_text)
+					typename = "text";
+				else
+					ereport(NOTICE,
+							(errmsg("error while generating the table definition"),
+							 errhint("If you encounter an error, you may need to execute the following first:\nDO $$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type WHERE typname = '%s') THEN CREATE TYPE %s AS %s; END IF; END$$;\n",
+									 typename, typename, typedfn)));
+			}
+
+			/*
+			 * PostgreSQL does not have an equivalent data type to map with
+			 * SET, so skip the table definitions for the ones having SET type
+			 * column.
+			 */
+			if (strncmp(typedfn, "set", 3) == 0)
+			{
+				ereport(WARNING,
+						(errmsg("skipping import for relation \"%s\"", quote_identifier(tablename)),
+						 errdetail("MySQL SET columns are not supported.")));
+
+				has_set = true;
+				continue;
+			}
 
 			if (first_item)
 				first_item = false;
@@ -3648,6 +3730,13 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 		while ((row = mysql_fetch_row(res)) &&
 			   (strcmp(row[0], tablename) == 0));
+
+		/*
+		 * As explained above, skip importing relations that have SET type
+		 * column.
+		 */
+		if (has_set)
+			continue;
 
 		/*
 		 * Add server name and table-level options.  We specify remote
@@ -3944,6 +4033,14 @@ mysql_set_transmission_modes(void)
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SAVE, true, 0, false);
 
+	/*
+	 * In addition force restrictive search_path, in case there are any
+	 * regproc or similar constants to be printed.
+	 */
+	(void) set_config_option("search_path", "pg_catalog",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
 	return nestlevel;
 }
 
@@ -4170,8 +4267,8 @@ execute_dml_stmt(ForeignScanState *node)
 							 &mysql_bind_buffer,
 							 dmstate->param_types);
 
-		mysql_stmt_bind_param(dmstate->stmt, mysql_bind_buffer);
-		mysql_stmt_error_print(dmstate->conn, dmstate->stmt, "failed to bind the MySQL query");
+		if (mysql_stmt_bind_param(dmstate->stmt, mysql_bind_buffer) != 0)
+			mysql_stmt_error_print(dmstate->conn, dmstate->stmt, "failed to bind the MySQL query");
 	}
 
 	/*
@@ -4405,6 +4502,10 @@ mysqlGetForeignJoinPaths(PlannerInfo *root,
 	fpinfo->width = width;
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
+
+	/* TODO: Put accurate estimates here */
+	startup_cost = 15.0;
+	total_cost = 20 + startup_cost;
 
 	/*
 	 * Create a new join path and add it to the joinrel which represents a
@@ -5228,20 +5329,8 @@ estimate_path_cost_size(PlannerInfo *root,
 	/* Return results. */
 	*p_rows = rows;
 	*p_width = width;
-
-	/*
-	 * If FDW has stub function to push down, set cost to 0
-	 */
-	if (mysql_is_foreign_function_tlist(root, foreignrel, root->parse->targetList))
-	{
-		*p_startup_cost = 0;
-		*p_total_cost = 0;
-	}
-	else
-	{
-		*p_startup_cost = startup_cost;
-		*p_total_cost = total_cost;
-	}
+	*p_startup_cost = startup_cost;
+	*p_total_cost = total_cost;
 }
 
 /*
@@ -5306,6 +5395,55 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 
 	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel);
 
+	/*
+	 * Before creating sorted paths, arrange for the passed-in EPQ path, if
+	 * any, to return columns needed by the parent ForeignScan node so that
+	 * they will propagate up through Sort nodes injected below, if necessary.
+	 */
+	if (epq_path != NULL && useful_pathkeys_list != NIL)
+	{
+		MySQLFdwRelationInfo *fpinfo = (MySQLFdwRelationInfo *) rel->fdw_private;
+		PathTarget *target = copy_pathtarget(epq_path->pathtarget);
+
+		/* Include columns required for evaluating PHVs in the tlist. */
+		add_new_columns_to_pathtarget(target,
+									  pull_var_clause((Node *) target->exprs,
+													  PVC_RECURSE_PLACEHOLDERS));
+
+		/* Include columns required for evaluating the local conditions. */
+		foreach(lc, fpinfo->local_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			add_new_columns_to_pathtarget(target,
+										  pull_var_clause((Node *) rinfo->clause,
+														  PVC_RECURSE_PLACEHOLDERS));
+		}
+
+		/*
+		 * If we have added any new columns, adjust the tlist of the EPQ path.
+		 *
+		 * Note: the plan created using this path will only be used to execute
+		 * EPQ checks, where accuracy of the plan cost and width estimates
+		 * would not be important, so we do not do set_pathtarget_cost_width()
+		 * for the new pathtarget here.  See also postgresGetForeignPlan().
+		 */
+		if (list_length(target->exprs) > list_length(epq_path->pathtarget->exprs))
+		{
+			/* The EPQ path is a join path, so it is projection-capable. */
+			Assert(is_projection_capable_path(epq_path));
+
+			/*
+			 * Use create_projection_path() here, so as to avoid modifying it
+			 * in place.
+			 */
+			epq_path = (Path *) create_projection_path(root,
+													   rel,
+													   epq_path,
+													   target);
+		}
+	}
+
 	/* Create one path for each set of pathkeys we found above. */
 	foreach(lc, useful_pathkeys_list)
 	{
@@ -5318,6 +5456,11 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		estimate_path_cost_size(root, rel, NIL, useful_pathkeys, NULL,
 								&rows, &width, &startup_cost, &total_cost);
+
+		/* Use small cost to avoid calculating real cost size in MySQL.
+		 * The cost less than cost of JOINREL and greater than UPPERREL_GROUP_AGG
+		 */
+		rows = startup_cost = total_cost = 30;
 
 		/*
 		 * The EPQ path must be at least as well sorted as the path itself, in
@@ -5546,18 +5689,8 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 		foreach(lc, root->query_pathkeys)
 		{
 			PathKey    *pathkey = (PathKey *) lfirst(lc);
-			EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
-			Expr	   *em_expr;
 
-			/*
-			 * The planner and executor don't have any clever strategy for
-			 * taking data sorted by a prefix of the query's pathkeys and
-			 * getting it to be sorted by all of those pathkeys. We'll just
-			 * end up resorting the entire data set.  So, unless we can push
-			 * down all of the query pathkeys, forget it.
-			 */
-			if (!(em_expr = mysql_find_em_expr_for_rel(pathkey_ec, rel)) ||
-				!mysql_is_foreign_expr(root, rel, em_expr))
+			if (!mysql_is_foreign_pathkey(root, rel, pathkey))
 			{
 				query_pathkeys_ok = false;
 				break;
@@ -5604,7 +5737,6 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 	foreach(lc, useful_eclass_list)
 	{
 		EquivalenceClass *cur_ec = lfirst(lc);
-		Expr	   *em_expr;
 		PathKey    *pathkey;
 
 		/* If redundant with what we did above, skip it. */
@@ -5612,8 +5744,7 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 			continue;
 
 		/* If no pushable expression for this rel, skip it. */
-		em_expr = mysql_find_em_expr_for_rel(cur_ec, rel);
-		if (em_expr == NULL || !mysql_is_foreign_expr(root, rel, em_expr))
+		if (mysql_find_em_for_rel(root, cur_ec, rel) == NULL)
 			continue;
 
 		/* Looks like we can generate a pathkey, so let's do it. */
@@ -5764,45 +5895,6 @@ ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 	/* This is the new target to process. */
 	state->current = expr;
 	return true;
-}
-
-/*
- * Find an equivalence class member expression, all of whose Vars, come from
- * the indicated relation.
- */
-Expr *
-mysql_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
-{
-	ListCell   *lc_em;
-
-	foreach(lc_em, ec->ec_members)
-	{
-		EquivalenceMember *em = lfirst(lc_em);
-
-		/* ignore this check for volatile stub function */
-		if (IsA(em->em_expr, FuncExpr))
-		{
-			FuncExpr   *fe = (FuncExpr *) em->em_expr;
-
-			if (!mysql_is_builtin(fe->funcid) &&
-				contain_volatile_functions((Node *) fe))
-				return em->em_expr;
-		}
-
-		if (bms_is_subset(em->em_relids, rel->relids) &&
-			!bms_is_empty(em->em_relids))
-		{
-			/*
-			 * If there is more than one equivalence member whose Vars are
-			 * taken entirely from this relation, we'll be content to choose
-			 * any one of those.
-			 */
-			return em->em_expr;
-		}
-	}
-
-	/* We didn't find any suitable equivalence class expression */
-	return NULL;
 }
 
 /*
@@ -6050,7 +6142,7 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	 */
 
 	fpinfo->relation_name = makeStringInfo();
-	appendStringInfo(fpinfo->relation_name, "Aggregate on (%s ",
+	appendStringInfo(fpinfo->relation_name, "Aggregate on (%s)",
 					 ofpinfo->relation_name->data);
 
 	return true;
@@ -6177,6 +6269,24 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	estimate_path_cost_size(root, grouped_rel, NIL, NIL, NULL,
 							&rows, &width, &startup_cost, &total_cost);
 
+	/*
+	 * TODO: Put accurate estimates here.
+	 *
+	 * Cost used here is minimum of the cost estimated for base and join
+	 * relation.
+	 * If FDW has stub function to push down, set cost to 0
+	 */
+	if (mysql_is_foreign_function_tlist(root, grouped_rel, root->parse->targetList))
+	{
+		startup_cost = 0;
+		total_cost = 0;
+	}
+	else
+	{
+		startup_cost = 10;
+		total_cost = 5 + startup_cost;
+	}
+
 	/* Now update this information in the fpinfo */
 	fpinfo->rows = rows;
 	fpinfo->width = width;
@@ -6273,15 +6383,14 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	{
 		PathKey    *pathkey = (PathKey *) lfirst(lc);
 		EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
-		Expr	   *sort_expr;
 
-		/* Get the sort expression for the pathkey_ec */
-		sort_expr = mysql_find_em_expr_for_input_target(root,
-														pathkey_ec,
-														input_rel->reltarget);
-
-		/* If it's unsafe to remote, we cannot push down the final sort */
-		if (!mysql_is_foreign_expr(root, input_rel, sort_expr))
+		/*
+		 * The EC must contain a shippable EM that is computed in input_rel's
+		 * reltarget, else we can't push down the sort.
+		 */
+		if (mysql_find_em_for_rel_target(root,
+								   pathkey_ec,
+								   input_rel) == NULL)
 			return;
 	}
 
@@ -6301,7 +6410,14 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Build the fdw_private list that will be used by mysqlGetForeignPlan.
 	 * Items in the list must match order in enum FdwPathPrivateIndex.
 	 */
+#if PG_VERSION_NUM >= 150000
+	fdw_private = list_make2(makeBoolean(true), makeBoolean(false));
+#else
 	fdw_private = list_make2(makeInteger(true), makeInteger(false));
+#endif
+
+	/* Use small cost to push down orderby always */
+	startup_cost = total_cost = 5;
 
 	/* Create foreign ordering path */
 	ordered_path = create_foreign_upper_path(root,
@@ -6532,6 +6648,10 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	}
 	estimate_path_cost_size(root, input_rel, NIL, pathkeys, fpextra,
 							&rows, &width, &startup_cost, &total_cost);
+
+	/* Use small cost to push down limit always */
+	startup_cost = total_cost = 0;
+
 	if (!fpextra->has_final_sort)
 		ifpinfo->use_remote_estimate = save_use_remote_estimate;
 
@@ -6539,8 +6659,13 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Build the fdw_private list that will be used by mysqlGetForeignPlan.
 	 * Items in the list must match order in enum FdwPathPrivateIndex.
 	 */
+#if PG_VERSION_NUM >= 150000
+	fdw_private = list_make2(makeBoolean(has_final_sort),
+							 makeBoolean(extra->limit_needed));
+#else
 	fdw_private = list_make2(makeInteger(has_final_sort),
 							 makeInteger(extra->limit_needed));
+#endif
 
 	/*
 	 * Create foreign final path; this gets rid of a no-longer-needed outer

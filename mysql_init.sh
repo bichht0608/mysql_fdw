@@ -1,5 +1,5 @@
 #!/bin/sh
-export MYSQL_PWD="edb"
+export MYSQL_PWD="edb1"
 MYSQL_HOST="localhost"
 MYSQL_PORT="3306"
 MYSQL_USER_NAME="edb"
@@ -23,7 +23,7 @@ MYSQL_USER_NAME="edb"
 # SET GLOBAL validate_password.mixed_case_count = 0;
 # SET GLOBAL validate_password.number_count = 0;
 # SET GLOBAL validate_password.special_char_count = 0;
-# CREATE USER 'edb'@'localhost' IDENTIFIED BY 'edb';
+# CREATE USER 'edb'@'localhost' IDENTIFIED BY 'edb1';
 # GRANT ALL PRIVILEGES ON mysql_fdw_regress.* TO 'edb'@'localhost';
 # GRANT ALL PRIVILEGES ON mysql_fdw_regress1.* TO 'edb'@'localhost';
 # GRANT ALL PRIVILEGES ON mysql_fdw_post.* TO 'edb'@'localhost';
@@ -53,8 +53,10 @@ mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e 
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS test3;"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS test4;"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS test5;"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS test_set;"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS test6;"
 
-mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE mysql_test(a int primary key, b int);"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE mysql_test(a int primary key, b int not null);"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO mysql_test(a,b) VALUES (1,1);"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE empdata (emp_id int, emp_dat blob, PRIMARY KEY (emp_id));"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE numbers (a int PRIMARY KEY, b varchar(255));"
@@ -72,6 +74,9 @@ mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e 
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE test4 (c1 int PRIMARY KEY, c2 int, c3 varchar(255))"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE test5 (c1 int primary key, c2 binary, c3 binary(3), c4 binary(1), c5 binary(10), c6 varbinary(3), c7 varbinary(1), c8 varbinary(10), c9 binary(0), c10 varbinary(0));"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO test5 VALUES (1, 'c', 'c3c', 't', 'c5c5c5', '04', '1', '01-10-2021', NULL, '');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE test_set (c1 int primary key, c2 SET('a', 'b', 'c', 'd'), c3 int);"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE test6 (c1 numeric(6,4))"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO test6 VALUES (25.252525)"
 
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS s3;"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE s3(id int PRIMARY KEY, tag1 text, value1 float, value2 int, value3 float, value4 int, str1 text, str2 text);"

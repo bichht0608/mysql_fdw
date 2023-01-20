@@ -1,16 +1,16 @@
 # mysql_fdw/Makefile
 #
 # Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
-# Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+# Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
 #
 
 MODULE_big = mysql_fdw
 OBJS = connection.o option.o deparse.o mysql_query.o mysql_fdw.o
 
 EXTENSION = mysql_fdw
-DATA = mysql_fdw--1.0.sql mysql_fdw--1.0--1.1.sql mysql_fdw--1.1.sql mysql_fdw--1.2.sql
+DATA = mysql_fdw--1.0.sql mysql_fdw--1.0--1.1.sql mysql_fdw--1.1.sql mysql_fdw--1.2.sql mysql_fdw--1.3.sql
 
-REGRESS = mysql_fdw server_options connection_validation dml select pushdown selectfunc mysql_fdw_post join_pushdown extra/aggregates
+REGRESS = mysql_fdw server_options connection_validation dml select pushdown selectfunc mysql_fdw_post join_pushdown aggregate_pushdown extra/aggregates
 
 MYSQL_CONFIG = mysql_config
 PG_CPPFLAGS := $(shell $(MYSQL_CONFIG) --include)

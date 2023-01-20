@@ -4,7 +4,7 @@
  * 		Connection management functions for mysql_fdw
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- * Portions Copyright (c) 2004-2021, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2022, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		connection.c
@@ -14,10 +14,10 @@
 
 #include "postgres.h"
 
+#include <errmsg.h>
 #if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
 #endif
-#include "mb/pg_wchar.h"
 #include "mysql_fdw.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -69,15 +69,16 @@ typedef struct ConnCacheEntry
 static HTAB *ConnectionHash = NULL;
 
 /* tracks whether any work is needed in callback functions */
-static bool xact_got_connection = false;
+static volatile bool xact_got_connection = false;
 
 static void mysql_inval_callback(Datum arg, int cacheid, uint32 hashvalue);
 static void mysql_do_sql_command(MYSQL * conn, const char *sql, int level);
 static void mysql_begin_remote_xact(ConnCacheEntry *entry);
 static void mysql_xact_callback(XactEvent event, void *arg);
+static void mysql_reset_xact_state(ConnCacheEntry *entry, bool toplevel);
 static void mysql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								   SubTransactionId parentSubid, void *arg);
-
+static void mysql_fdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel);
 /*
  * SQL functions
  */
@@ -366,7 +367,7 @@ mysql_connect(mysql_opt * opt)
 				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
 				 errmsg("failed to initialise the MySQL connection object")));
 
-	mysql_options(conn, MYSQL_SET_CHARSET_NAME, GetDatabaseEncodingName());
+	mysql_options(conn, MYSQL_SET_CHARSET_NAME, opt->character_set);
 #if MYSQL_VERSION_ID < 80000
 	mysql_options(conn, MYSQL_SECURE_AUTH, &secure_auth);
 #endif
@@ -566,17 +567,31 @@ mysql_xact_callback(XactEvent event, void *arg)
 				case XACT_EVENT_PARALLEL_ABORT:
 				case XACT_EVENT_ABORT:
 					{
-						elog(DEBUG3, "mysql_fdw abort transaction");
-
-						/*
-						 * rollback if in transaction
-						 */
-						mysql_do_sql_command(entry->conn, "ROLLBACK", WARNING);
+						mysql_fdw_abort_cleanup(entry, true);
 						break;
 					}
 			}
 		}
 
+		/* Reset state to show we're out of a transaction */
+		mysql_reset_xact_state(entry, true);
+	}
+
+	/*
+	 * Regardless of the event type, we can now mark ourselves as out of the
+	 * transaction.
+	 */
+	xact_got_connection = false;
+}
+
+/*
+ * mysql_reset_xact_state --- Reset state to show we're out of a (sub)transaction.
+ */
+static void
+mysql_reset_xact_state(ConnCacheEntry *entry, bool toplevel)
+{
+	if (toplevel)
+	{
 		/* Reset state to show we're out of a transaction */
 		entry->xact_depth = 0;
 		if (entry->invalidated || !entry->keep_connections)
@@ -585,12 +600,11 @@ mysql_xact_callback(XactEvent event, void *arg)
 			disconnect_mysql_server(entry);
 		}
 	}
-
-	/*
-	 * Regardless of the event type, we can now mark ourselves as out of the
-	 * transaction.
-	 */
-	xact_got_connection = false;
+	else
+	{
+		/* Reset state to show we're out of a subtransaction */
+		entry->xact_depth--;
+	}
 }
 
 /*
@@ -650,18 +664,44 @@ mysql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		else
 		{
 			/* Rollback all remote subtransactions during abort */
-			snprintf(sql, sizeof(sql),
-					 "ROLLBACK TO SAVEPOINT s%d",
-					 curlevel);
-			mysql_do_sql_command(entry->conn, sql, ERROR);
-			snprintf(sql, sizeof(sql),
-					 "RELEASE SAVEPOINT s%d",
-					 curlevel);
-			mysql_do_sql_command(entry->conn, sql, ERROR);
+			mysql_fdw_abort_cleanup(entry, false);
 		}
 
 		/* OK, we're outta that level of subtransaction */
-		entry->xact_depth--;
+		mysql_reset_xact_state(entry, false);
+	}
+}
+
+/*
+ * Abort remote transaction or subtransaction.
+ *
+ * "toplevel" should be set to true if toplevel (main) transaction is
+ * rollbacked, false otherwise.
+ */
+static void
+mysql_fdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
+{
+	if (toplevel)
+	{
+		elog(DEBUG3, "mysql_fdw abort transaction");
+		/*
+		 * rollback if in transaction
+		 */
+		mysql_do_sql_command(entry->conn, "ROLLBACK", WARNING);
+	}
+	else
+	{
+		char	sql[100];
+		int curlevel = GetCurrentTransactionNestLevel();
+
+		snprintf(sql, sizeof(sql),
+					"ROLLBACK TO SAVEPOINT s%d",
+					curlevel);
+		mysql_do_sql_command(entry->conn, sql, ERROR);
+		snprintf(sql, sizeof(sql),
+					"RELEASE SAVEPOINT s%d",
+					curlevel);
+		mysql_do_sql_command(entry->conn, sql, ERROR);
 	}
 }
 
@@ -684,13 +724,18 @@ mysql_fdw_get_connections(PG_FUNCTION_ARGS)
 {
 #define MYSQL_FDW_GET_CONNECTIONS_COLS	2
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+#if PG_VERSION_NUM < 150000
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
-	HASH_SEQ_STATUS scan;
-	ConnCacheEntry *entry;
+#endif
 
+#if PG_VERSION_NUM >= 150000
+	SetSingleFuncCall(fcinfo, 0);
+#else
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -715,12 +760,15 @@ mysql_fdw_get_connections(PG_FUNCTION_ARGS)
 	rsinfo->setDesc = tupdesc;
 
 	MemoryContextSwitchTo(oldcontext);
+#endif
 
 	/* If cache doesn't exist, we return no records */
 	if (!ConnectionHash)
 	{
+#if PG_VERSION_NUM < 150000
 		/* clean up and return the tuplestore */
 		tuplestore_donestoring(tupstore);
+#endif
 
 		PG_RETURN_VOID();
 	}
@@ -785,11 +833,17 @@ mysql_fdw_get_connections(PG_FUNCTION_ARGS)
 
 		values[1] = BoolGetDatum(!entry->invalidated);
 
+#if PG_VERSION_NUM >= 150000
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+#else
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+#endif
 	}
 
+#if PG_VERSION_NUM < 150000
 	/* clean up and return the tuplestore */
 	tuplestore_donestoring(tupstore);
+#endif
 
 	PG_RETURN_VOID();
 }
