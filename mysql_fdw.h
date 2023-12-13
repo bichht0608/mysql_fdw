@@ -85,6 +85,7 @@
 #define mysql_num_rows (*_mysql_num_rows)
 #define mysql_warning_count (*_mysql_warning_count)
 #define mysql_stmt_affected_rows (*_mysql_stmt_affected_rows)
+#define mysql_server_end (*_mysql_server_end)
 
 /*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
@@ -379,8 +380,6 @@ typedef struct MySQLFdwDirectModifyState
 #endif
 }			MySQLFdwDirectModifyState;
 
-
-
 /* MySQL Column List */
 typedef struct MySQLColumn
 {
@@ -437,9 +436,25 @@ extern unsigned int ((mysql_num_fields) (MYSQL_RES * result));
 extern unsigned int ((mysql_num_rows) (MYSQL_RES * result));
 extern unsigned int ((mysql_warning_count) (MYSQL * mysql));
 extern uint64_t ((mysql_stmt_affected_rows) (MYSQL_STMT * stmt));
+extern void ((mysql_server_end) (void));
 
 void		mysql_reset_transmission_modes(int nestlevel);
 int			mysql_set_transmission_modes(void);
+extern
+#if (PG_VERSION_NUM >= 160000)
+PGDLLEXPORT
+#endif
+int	ExecForeignDDL(Oid serverOid,
+						   Relation rel,
+						   int operation,
+						   bool if_not_exists);
+extern void mysql_deparse_create_table_sql(StringInfo buf,
+								  Relation rel,
+								  bool if_not_exist);
+extern void mysql_deparse_drop_table_sql(StringInfo buf,
+								Relation rel,
+								bool exists_flag);
+void		mysql_error_print(MYSQL * conn, const char *msg);
 
 /* option.c headers */
 extern bool mysql_is_valid_option(const char *option, Oid context);
@@ -526,7 +541,6 @@ extern List *mysql_pull_func_clause(Node *node);
 /* connection.c headers */
 MYSQL	   *mysql_get_connection(ForeignServer *server, UserMapping *user,
 								 mysql_opt * opt);
-MYSQL	   *mysql_connect(mysql_opt * opt);
 void		mysql_cleanup_connection(void);
 void		mysql_release_connection(MYSQL * conn);
 extern char *mysql_quote_identifier(const char *str, char quotechar);

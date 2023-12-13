@@ -138,6 +138,8 @@ DROP TABLE IF EXISTS `yy`;
 DROP TABLE IF EXISTS `zt1`;
 DROP TABLE IF EXISTS `zt2`;
 DROP TABLE IF EXISTS `zt3`;
+DROP TABLE IF EXISTS `agg_anyvalue`;
+DROP TABLE IF EXISTS `pagg_test`;
 SET FOREIGN_KEY_CHECKS = 1;
 
 CREATE TABLE btgtest(id int primary key, p int, c float, d float, e float);
@@ -387,8 +389,8 @@ create table agg_t13(x int, id integer primary key auto_increment);
 create table agg_t14(x int, y int, id integer primary key auto_increment);
 create table agg_data_2k(g int , id integer primary key auto_increment);
 create table agg_data_20k(g int , id integer primary key auto_increment);
-create table t1(f1 int4, f2 int8, id integer primary key auto_increment);
-create table t2(f1 int8, f22 int8, id integer primary key auto_increment);
+create table t1(f1 int4, f2 int4, id integer primary key auto_increment);
+create table t2(f1 int8, f2 int8, id integer primary key auto_increment);
 create table agg_t15(a text, b int, c int, id integer primary key auto_increment);
 create table agg_t16(a text, b text, id integer primary key auto_increment);
 create table agg_t17(foo text, bar text, id integer primary key auto_increment);
@@ -573,3 +575,5 @@ CREATE TABLE update_test (
 
 create table upsert_test (a int primary key, b text);
 
+CREATE TABLE agg_anyvalue(id int PRIMARY KEY, c1 json, c2 int);
+create table pagg_test (x int, y int, id integer primary key auto_increment);

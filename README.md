@@ -5,7 +5,7 @@ This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
 [MySQL][1].
 
 Please note that this version of mysql_fdw works with PostgreSQL and EDB
-Postgres Advanced Server 12, 13 and 14.
+Postgres Advanced Server 12, 13, 14, 15 and 16.
 
 Installation
 ------------
@@ -149,6 +149,17 @@ Json:
 "json_search", "json_set", "json_storage_free", "json_storage_size", "json_table",
 "json_type", "json_unquote", "json_valid", "json_value", "member_of".
 ```
+Date/Time:
+```
+"adddate", "addtime", "convert_tz", "curdate", "current_date", "curtime", "current_time",
+"current_timestamp", "date_add", "date_format", "date_sub", "datediff", "day", "dayname",
+"dayofmonth", "dayofweek", "dayofyear", "extract", "from_days", "from_unixtime", "get_format",
+"hour", "last_day", "localtime", "localtimestamp", "makedate", "maketime", "microsecond",
+"minute", "month", "monthname", "now", "period_add", "period_diff", "quarter", "sec_to_time",
+"second", "str_to_date", "subdate", "subtime", "sysdate", "time", "time_format", "time_to_sec",
+"timediff", "timestamp", "timestampadd", "timestampdiff", "to_days", "to_seconds", "unix_timestamp",
+"utc_date", "utc_time", "utc_timestamp", "week", "weekday", "weekofyear", "year", "yearweek"
+```
 
 Cast:
 ```
@@ -183,7 +194,17 @@ List of unique functions of Mysql with different name and syntax:
     ```
   - json_value:   
   Example: SELECT c1 FROM ftbl WHERE json_value(c1, '$.a', `'returning date'`)::date > '2001-01-01';
+  - date_add: From Postgres version 16beta2, there are 3 date_add functions with different argument:
+    - date_add ( timestamp with time zone, interval ) → timestamp with time zone: this is function of Postgres, not push down.
+    - date_add ( timestamp with time zone, interval [, text ] ) → timestamp with time zone: this is function of Postgres, not push down.
+    - date_add ( timestamp without time zone, interval ) -> timestamp without time zone: this is function of MySQL, can push down.
 
+    To make sure that mysql_fdw can push down date_add function, user needs to pass the 1st argument of date_add as timestamp [without time zone].
+    Example:
+    - Cast the 1st argument to timestamp:<br>
+    SELECT c1 FROM ftbl WHERE date_add(c1::timestamp, '1 12:59:10'::interval) != '2000-01-01';
+    - Pass timestamp column directly into 1st argument of date_add. In the following example, c2 has type timestamp.<br>
+    SELECT c1 FROM ftbl WHERE date_add(c2, '1 12:59:10'::interval) != '2000-01-01';
 ### JOIN clause push-down
 mysql_fdw now also supports join push-down. The joins between two
 foreign tables from the same remote MySQL server are pushed to a remote
@@ -342,6 +363,12 @@ Limitation
 - ANY ARRAY: not support pushdown when operator different =, <> or right operand like sub-query.
 - MySQL stores floating-point numbers as approximate and not exact values. Therefore, comparing equality with floating-point numbers may lead to incorrect result. 
 - From MySQL version 8.0.31, if we insert 'infinity' and then select var_pop of it, MySQL FDW returns out of range error.
+- Update NULL value is possible for NOT NULL column because default value of strict mode is `ANSI_QUOTES`. Strict mode is mode of MySQL server, it can be set on either MySQL server or MySQL FDW.<br>
+Therefore, update value of strict mode through `sql_mode` option to change the way to validate data if needed. <br>
+For example, changing strict mode via `sql_mode` option in MySQL FDW: <br>
+  ```
+  CREATE SERVER mysql_svr FOREIGN DATA WRAPPER mysql_fdw OPTIONS (host 'localhost', port '1234', sql_mode 'TRADITIONAL');
+  ```
 
 Contributing
 ------------

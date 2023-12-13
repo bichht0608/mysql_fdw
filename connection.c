@@ -57,7 +57,6 @@ typedef struct ConnCacheEntry
 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
 	int			xact_depth;		/* 0 = no xact open, 1 = main xact open, 2 =
 								 * one level of subxact open, etc */
-
 	bool		keep_connections;	/* setting value of keep_connections
 									 * server option */
 	Oid			serverid;		/* foreign server OID used to get server name */
@@ -72,7 +71,7 @@ static HTAB *ConnectionHash = NULL;
 static volatile bool xact_got_connection = false;
 
 static void mysql_inval_callback(Datum arg, int cacheid, uint32 hashvalue);
-static void mysql_do_sql_command(MYSQL * conn, const char *sql, int level);
+static void mysql_do_sql_command(MYSQL * conn, const char *sql);
 static void mysql_begin_remote_xact(ConnCacheEntry *entry);
 static void mysql_xact_callback(XactEvent event, void *arg);
 static void mysql_reset_xact_state(ConnCacheEntry *entry, bool toplevel);
@@ -88,6 +87,7 @@ PG_FUNCTION_INFO_V1(mysql_fdw_disconnect_all);
 
 /* prototypes of private functions */
 static void mysql_make_new_connection(ConnCacheEntry *entry, UserMapping *user, mysql_opt * opt);
+static MYSQL *mysql_connect(mysql_opt * opt);
 #if PG_VERSION_NUM >= 140000
 static bool disconnect_cached_connections(Oid serverid);
 #endif
@@ -294,6 +294,10 @@ mysql_make_new_connection(ConnCacheEntry *entry, UserMapping *user, mysql_opt * 
 	/* Now try to make the connection */
 	entry->conn = mysql_connect(opt);
 
+	/* Change time_zone of connection session to UTC/GMT */
+	if (mysql_query(entry->conn, "SET time_zone = \"+00:00\"") != 0)
+		mysql_error_print(entry->conn, NULL);
+
 	elog(DEBUG3, "new mysql_fdw connection %p for server \"%s\"",
 		 entry->conn, server->servername);
 }
@@ -348,60 +352,92 @@ mysql_release_connection(MYSQL * conn)
 	}
 }
 
-MYSQL *
+/*
+ * Establish a connection to a MySQL server.
+ */
+static MYSQL *
 mysql_connect(mysql_opt * opt)
 {
-	MYSQL	   *conn;
-	char	   *svr_database = opt->svr_database;
-	bool		svr_sa = opt->svr_sa;
-	char	   *svr_init_command = opt->svr_init_command;
-	char	   *ssl_cipher = opt->ssl_cipher;
-#if	MYSQL_VERSION_ID < 80000
-	my_bool		secure_auth = svr_sa;
-#endif
-
-	/* Connect to the server */
-	conn = mysql_init(NULL);
-	if (!conn)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-				 errmsg("failed to initialise the MySQL connection object")));
-
-	mysql_options(conn, MYSQL_SET_CHARSET_NAME, opt->character_set);
-#if MYSQL_VERSION_ID < 80000
-	mysql_options(conn, MYSQL_SECURE_AUTH, &secure_auth);
-#endif
-
-	if (!svr_sa)
-		elog(WARNING, "MySQL secure authentication is off");
-
-	if (svr_init_command != NULL)
-		mysql_options(conn, MYSQL_INIT_COMMAND, svr_init_command);
+	MYSQL	   *volatile conn = NULL;
 
 	/*
-	 * Enable or disable automatic reconnection to the MySQL server if the
-	 * existing connection is found to have been lost.
+	 * Use PG_TRY block to ensure closing connection on error.
 	 */
-	mysql_options(conn, MYSQL_OPT_RECONNECT, &opt->reconnect);
+	PG_TRY();
+	{
+		char	   *svr_database = opt->svr_database;
+		bool		svr_sa = opt->svr_sa;
+		char	   *svr_init_command = opt->svr_init_command;
+		char	   *ssl_cipher = opt->ssl_cipher;
+#if	MYSQL_VERSION_ID < 80000
+		my_bool		secure_auth = svr_sa;
+#endif
+		int			ret;
 
-	mysql_ssl_set(conn, opt->ssl_key, opt->ssl_cert, opt->ssl_ca,
-				  opt->ssl_capath, ssl_cipher);
+		/* Connect to the server */
+		conn = mysql_init(NULL);
+		if (!conn)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+					errmsg("failed to initialise the MySQL connection object")));
 
-	if (!mysql_real_connect(conn, opt->svr_address, opt->svr_username,
-							opt->svr_password, svr_database, opt->svr_port,
-							NULL, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to MySQL: %s", mysql_error(conn))));
+		ret = mysql_options(conn, MYSQL_SET_CHARSET_NAME, opt->character_set);
+		if (ret != 0)
+			elog(ERROR, "mysql_fdw: could not set character set for MYSQL_SET_CHARSET_NAME option");
 
-	/* Useful for verifying that the connection's secured */
-	elog(DEBUG1,
-		 "Successfully connected to MySQL database %s at server %s with cipher %s (server version: %s, protocol version: %d) ",
-		 (svr_database != NULL) ? svr_database : "<none>",
-		 mysql_get_host_info(conn),
-		 (ssl_cipher != NULL) ? ssl_cipher : "<none>",
-		 mysql_get_server_info(conn),
-		 mysql_get_proto_info(conn));
+#if MYSQL_VERSION_ID < 80000
+		ret = mysql_options(conn, MYSQL_SECURE_AUTH, &secure_auth);
+		if (ret != 0)
+			elog(ERROR, "mysql_fdw: could not set secure authentication for MYSQL_SECURE_AUTH option");
+#endif
+
+		if (!svr_sa)
+			elog(WARNING, "MySQL secure authentication is off");
+
+		if (svr_init_command != NULL)
+		{
+			ret = mysql_options(conn, MYSQL_INIT_COMMAND, svr_init_command);
+			if (ret != 0)
+				elog(ERROR, "mysql_fdw: could not set SQL statement for MYSQL_INIT_COMMAND option");
+		}
+
+		/*
+		 * Enable or disable automatic reconnection to the MySQL server if the
+		 * existing connection is found to have been lost.
+		 */
+		ret = mysql_options(conn, MYSQL_OPT_RECONNECT, &opt->reconnect);
+		if (ret != 0)
+			elog(ERROR, "mysql_fdw: could not set automatic reconnection for MYSQL_OPT_RECONNECT option");
+
+		mysql_ssl_set(conn, opt->ssl_key, opt->ssl_cert, opt->ssl_ca,
+					opt->ssl_capath, ssl_cipher);
+
+		if (!mysql_real_connect(conn, opt->svr_address, opt->svr_username,
+								opt->svr_password, svr_database, opt->svr_port,
+								NULL, 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					errmsg("failed to connect to MySQL: %s", mysql_error(conn))));
+
+		/* Useful for verifying that the connection's secured */
+		elog(DEBUG1,
+			"Successfully connected to MySQL database %s at server %s with cipher %s (server version: %s, protocol version: %d) ",
+			(svr_database != NULL) ? svr_database : "<none>",
+			mysql_get_host_info(conn),
+			(ssl_cipher != NULL) ? ssl_cipher : "<none>",
+			mysql_get_server_info(conn),
+			mysql_get_proto_info(conn));
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL data structure if we managed to create one */
+		if (conn)
+		{
+			mysql_close(conn);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	return conn;
 }
@@ -457,17 +493,12 @@ mysql_inval_callback(Datum arg, int cacheid, uint32 hashvalue)
  * Convenience subroutine to issue a non-data-returning SQL command to remote
  */
 static void
-mysql_do_sql_command(MYSQL * conn, const char *sql, int level)
+mysql_do_sql_command(MYSQL * conn, const char *sql)
 {
 	elog(DEBUG3, "mysql_fdw do_sql_command %s", sql);
 
 	if (mysql_query(conn, sql) != 0)
-	{
-		ereport(level,
-				(errcode(ERRCODE_FDW_ERROR),
-				 errmsg("mysql_fdw: failed to execute sql: %s, Error %u: %s\n", sql, mysql_errno(conn), mysql_error(conn))
-				 ));
-	}
+		mysql_error_print(conn, NULL);
 }
 
 /*
@@ -486,7 +517,7 @@ mysql_begin_remote_xact(ConnCacheEntry *entry)
 		elog(DEBUG3, "mysql_fdw starting remote transaction on connection %p",
 			 entry->conn);
 
-		mysql_do_sql_command(entry->conn, sql, ERROR);
+		mysql_do_sql_command(entry->conn, sql);
 		entry->xact_depth = 1;
 	}
 
@@ -499,7 +530,7 @@ mysql_begin_remote_xact(ConnCacheEntry *entry)
 	{
 		const char *sql = psprintf("SAVEPOINT s%d", entry->xact_depth + 1);
 
-		mysql_do_sql_command(entry->conn, sql, ERROR);
+		mysql_do_sql_command(entry->conn, sql);
 		entry->xact_depth++;
 	}
 }
@@ -541,7 +572,7 @@ mysql_xact_callback(XactEvent event, void *arg)
 				case XACT_EVENT_PARALLEL_PRE_COMMIT:
 				case XACT_EVENT_PRE_COMMIT:
 					/* Commit all remote transactions */
-					mysql_do_sql_command(entry->conn, "COMMIT", ERROR);
+					mysql_do_sql_command(entry->conn, "COMMIT");
 					break;
 				case XACT_EVENT_PRE_PREPARE:
 
@@ -652,7 +683,7 @@ mysql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		{
 			/* Commit all remote subtransactions during pre-commit */
 			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
-			mysql_do_sql_command(entry->conn, sql, ERROR);
+			mysql_do_sql_command(entry->conn, sql);
 		}
 		else if (in_error_recursion_trouble())
 		{
@@ -687,7 +718,7 @@ mysql_fdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 		/*
 		 * rollback if in transaction
 		 */
-		mysql_do_sql_command(entry->conn, "ROLLBACK", WARNING);
+		mysql_do_sql_command(entry->conn, "ROLLBACK");
 	}
 	else
 	{
@@ -697,11 +728,11 @@ mysql_fdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 		snprintf(sql, sizeof(sql),
 					"ROLLBACK TO SAVEPOINT s%d",
 					curlevel);
-		mysql_do_sql_command(entry->conn, sql, ERROR);
+		mysql_do_sql_command(entry->conn, sql);
 		snprintf(sql, sizeof(sql),
 					"RELEASE SAVEPOINT s%d",
 					curlevel);
-		mysql_do_sql_command(entry->conn, sql, ERROR);
+		mysql_do_sql_command(entry->conn, sql);
 	}
 }
 
@@ -732,8 +763,9 @@ mysql_fdw_get_connections(PG_FUNCTION_ARGS)
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 #endif
-
-#if PG_VERSION_NUM >= 150000
+#if PG_VERSION_NUM >= 160000
+	InitMaterializedSRF(fcinfo, 0);
+#elif PG_VERSION_NUM >= 150000
 	SetSingleFuncCall(fcinfo, 0);
 #else
 	/* check to see if caller supports us returning a tuplestore */
@@ -991,9 +1023,7 @@ disconnect_cached_connections(Oid serverid)
 			}
 			else
 			{
-				elog(DEBUG3, "mysql_fdw discarding connection %p", entry->conn);
-				mysql_close(entry->conn);
-				entry->conn = NULL;
+				disconnect_mysql_server(entry);
 				result = true;
 			}
 		}

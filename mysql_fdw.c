@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <errmsg.h>
 #include <mysql.h>
+#include <mysqld_error.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -53,10 +54,18 @@
 #include "optimizer/optimizer.h"
 #endif
 #include "optimizer/cost.h"
+#if (PG_VERSION_NUM >= 130010 && PG_VERSION_NUM < 140000) || \
+	(PG_VERSION_NUM >= 140007 && PG_VERSION_NUM < 150000) || \
+	(PG_VERSION_NUM >= 150002)
+#include "optimizer/inherit.h"
+#endif
 #include "optimizer/clauses.h"
 #include "optimizer/tlist.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#if PG_VERSION_NUM >= 160000
+#include "parser/parse_relation.h"
+#endif
 #include "storage/ipc.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -130,15 +139,19 @@ unsigned int ((mysql_num_fields) (MYSQL_RES * result));
 unsigned int ((mysql_num_rows) (MYSQL_RES * result));
 unsigned int ((mysql_warning_count) (MYSQL * mysql));
 uint64_t	((mysql_stmt_affected_rows) (MYSQL_STMT * stmt));
+void		((mysql_server_end) (void));
 
 #define DEFAULTE_NUM_ROWS    1000
 #define MYSQL_DEFAULT_QUERY_PARAM_MAX_LIMIT 65535
 
 /*
  * In PG 9.5.1 the number will be 90501,
- * our version is 2.8.0 so number will be 20800
+ * our version is 2.9.0 so number will be 20900
  */
-#define CODE_VERSION   20800
+#define CODE_VERSION   20900
+
+#define MYSQL_CMD_CREATE  0
+#define MYSQL_CMD_DROP    1
 
 /* Struct for extra information passed to estimate_path_cost_size() */
 typedef struct
@@ -424,7 +437,7 @@ static HeapTuple mysql_form_whole_row(MySQLWRState * wr_state, Datum *values,
  */
 bool		mysql_load_library(void);
 static void mysql_fdw_exit(int code, Datum arg);
-static bool mysql_is_column_unique(Oid foreigntableid);
+static bool mysql_is_column_unique(Oid foreigntableid, Oid userid);
 static void estimate_path_cost_size(PlannerInfo *root,
 									RelOptInfo *foreignrel,
 									List *param_join_conds,
@@ -469,9 +482,14 @@ static void execute_dml_stmt(ForeignScanState *node);
 void	   *mysql_dll_handle = NULL;
 static int	wait_timeout = WAIT_TIMEOUT;
 static int	interactive_timeout = INTERACTIVE_TIMEOUT;
-static void mysql_error_print(MYSQL * conn);
-static void mysql_stmt_error_print(MYSQL * conn, MYSQL_STMT * stmt, const char *msg);
+
+#if (PG_VERSION_NUM >= 130010 && PG_VERSION_NUM < 140000) || \
+	(PG_VERSION_NUM >= 140007 && PG_VERSION_NUM < 150000) || \
+	(PG_VERSION_NUM >= 150002)
+static List *getUpdateTargetAttrs(PlannerInfo *root, Index resultRelation);
+#else
 static List *getUpdateTargetAttrs(RangeTblEntry *rte);
+#endif
 
 static bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel,
 							JoinType jointype, RelOptInfo *outerrel, RelOptInfo *innerrel,
@@ -501,6 +519,7 @@ static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 static int	get_batch_size_option(Relation rel);
 static char *mysql_remove_backtick_quotes(char *s1);
 #endif
+static void mysql_close_stmt_handler(MYSQL * conn, MYSQL_STMT *stmt);
 
 /*
  * mysql_load_library function dynamically load the mysql's library
@@ -574,6 +593,7 @@ mysql_load_library(void)
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
 	_mysql_warning_count = dlsym(mysql_dll_handle, "mysql_warning_count");
 	_mysql_stmt_affected_rows = dlsym(mysql_dll_handle, "mysql_stmt_affected_rows");
+	_mysql_server_end = dlsym(mysql_dll_handle, "mysql_server_end");
 
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
@@ -606,7 +626,8 @@ mysql_load_library(void)
 		_mysql_get_server_info == NULL ||
 		_mysql_get_proto_info == NULL ||
 		_mysql_warning_count == NULL ||
-		_mysql_stmt_affected_rows == NULL)
+		_mysql_stmt_affected_rows == NULL ||
+		_mysql_server_end == NULL)
 		return false;
 
 	return true;
@@ -664,6 +685,12 @@ static void
 mysql_fdw_exit(int code, Datum arg)
 {
 	mysql_cleanup_connection();
+
+	/*
+	 * No longer to use the mysql client library,
+	 * clean up and free resources used by the library.
+	 */
+	mysql_server_end();
 }
 
 /*
@@ -758,7 +785,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignServer *server;
 	UserMapping *user;
 	ForeignTable *table;
-	char		timeout[255];
+	StringInfoData set_sql;
 	int			numParams;
 	int			rtindex;
 	List	   *fdw_private = fsplan->fdw_private;
@@ -789,7 +816,11 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 		TupleDesc	scan_tupdesc = ExecTypeFromTL(scan_tlist);
 
 		mysql_build_whole_row_constr_info(festate, tupleDescriptor,
+#if PG_VERSION_NUM < 160000
 										  fsplan->fs_relids,
+#else
+										  fsplan->fs_base_relids,
+#endif
 										  list_length(node->ss.ps.state->es_range_table),
 										  whole_row_lists, scan_tlist,
 										  fsplan->fdw_scan_tlist);
@@ -805,9 +836,18 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	if (fsplan->scan.scanrelid > 0)
 		rtindex = fsplan->scan.scanrelid;
 	else
+#if PG_VERSION_NUM < 160000
 		rtindex = bms_next_member(fsplan->fs_relids, -1);
+#else
+		rtindex = bms_next_member(fsplan->fs_base_relids, -1);
+#endif
 	rte = exec_rt_fetch(rtindex, estate);
+
+#if PG_VERSION_NUM < 160000
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	userid = OidIsValid(fsplan->checkAsUser) ? fsplan->checkAsUser : GetUserId();
+#endif
 
 	/* Get info about foreign table. */
 	table = GetForeignTable(rte->relid);
@@ -832,36 +872,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->query_executed = false;
 	festate->attinmeta = TupleDescGetAttInMetadata(tupleDescriptor);
 
-	if (wait_timeout > 0)
-	{
-		/* Set the session timeout in seconds */
-		sprintf(timeout, "SET wait_timeout = %d", wait_timeout);
-		mysql_query(festate->conn, timeout);
-	}
-
-	if (interactive_timeout > 0)
-	{
-		/* Set the session timeout in seconds */
-		sprintf(timeout, "SET interactive_timeout = %d", interactive_timeout);
-		mysql_query(festate->conn, timeout);
-	}
-
-	/* Change sql_mode to TRADITIONAL to catch warning "Division by 0" */
-	mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'");
-
-	/* Initialize the MySQL statement */
-	festate->stmt = mysql_stmt_init(festate->conn);
-	if (festate->stmt == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to initialize the mysql query: \n%s",
-						mysql_error(festate->conn))));
-
-	/* Prepare MySQL statement */
-	if (mysql_stmt_prepare(festate->stmt, festate->query,
-						   strlen(festate->query)) != 0)
-		mysql_stmt_error_print(festate->conn, festate->stmt, "failed to prepare the MySQL query");
-
 	/* Prepare for output conversion of parameters used in remote query. */
 	numParams = list_length(fsplan->fdw_exprs);
 	festate->numParams = numParams;
@@ -874,51 +884,96 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 							 &festate->param_values,
 							 &festate->param_types);
 
-	/* int column_count = mysql_num_fields(festate->meta); */
+	/* Build the SET query */
+	initStringInfo(&set_sql);
 
-	/* Set the statement as cursor type */
-	mysql_stmt_attr_set(festate->stmt, STMT_ATTR_CURSOR_TYPE, (void *) &type);
-
-	/* Set the pre-fetch rows */
-	mysql_stmt_attr_set(festate->stmt, STMT_ATTR_PREFETCH_ROWS,
-						(void *) &options->fetch_size);
-
-	if (tupleDescriptor->natts == 0)
-		return;
-
-	festate->table = (mysql_table *) palloc0(sizeof(mysql_table));
-	festate->table->column = (mysql_column *) palloc0(sizeof(mysql_column) * tupleDescriptor->natts);
-	festate->table->mysql_bind = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * tupleDescriptor->natts);
-
-	festate->table->mysql_res = mysql_stmt_result_metadata(festate->stmt);
-	if (NULL == festate->table->mysql_res)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to retrieve query result set metadata: \n%s",
-						mysql_error(festate->conn))));
-
-	festate->table->mysql_fields = mysql_fetch_fields(festate->table->mysql_res);
-
-	foreach(lc, festate->retrieved_attrs)
+	if (wait_timeout > 0)
 	{
-		int			attnum = lfirst_int(lc) - 1;
-		Oid			pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
-		int32		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
-
-		if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
-			continue;
-
-		festate->table->column[atindex].mysql_bind = &festate->table->mysql_bind[atindex];
-
-		mysql_bind_result(pgtype, pgtypmod,
-						  &festate->table->mysql_fields[atindex],
-						  &festate->table->column[atindex]);
-		atindex++;
+		/* Set the session timeout in seconds */
+		appendStringInfo(&set_sql, "SET wait_timeout = %d", wait_timeout);
+		if (mysql_query(festate->conn, set_sql.data) != 0)
+			mysql_error_print(conn, NULL);
 	}
 
-	/* Bind the results pointers for the prepare statements */
-	if (mysql_stmt_bind_result(festate->stmt, festate->table->mysql_bind) != 0)
-		mysql_stmt_error_print(festate->conn, festate->stmt, "failed to bind the MySQL query");
+	if (interactive_timeout > 0)
+	{
+		/* Set the session timeout in seconds */
+		resetStringInfo(&set_sql);
+		appendStringInfo(&set_sql, "SET interactive_timeout = %d", interactive_timeout);
+		if (mysql_query(festate->conn, set_sql.data) != 0)
+			mysql_error_print(conn, NULL);
+	}
+
+	/* Change sql_mode to TRADITIONAL to catch warning "Division by 0" */
+	if (mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'") != 0)
+		mysql_error_print(conn, NULL);
+
+	/*
+	 * Use PG_TRY block to ensure closing the MySQL statement handler on any error.
+	 */
+	PG_TRY();
+	{
+		/* Initialize the MySQL statement */
+		festate->stmt = mysql_stmt_init(festate->conn);
+		if (festate->stmt == NULL)
+			mysql_error_print(festate->conn, "failed to initialize the MySQL statement handler");
+
+		/* Prepare MySQL statement */
+		if (mysql_stmt_prepare(festate->stmt, festate->query,
+							strlen(festate->query)) != 0)
+			mysql_error_print(festate->conn, "failed to prepare the MySQL query");
+
+		/* Set the statement as cursor type */
+		if (mysql_stmt_attr_set(festate->stmt, STMT_ATTR_CURSOR_TYPE, (void *) &type) != 0)
+			mysql_error_print(festate->conn, "failed to set the statement as cursor type");
+
+		/* Set the pre-fetch rows */
+		if (mysql_stmt_attr_set(festate->stmt, STMT_ATTR_PREFETCH_ROWS,
+							(void *) &options->fetch_size) != 0)
+			mysql_error_print(festate->conn, "failed to set the pre-fetch rows");
+
+		if (tupleDescriptor->natts > 0)
+		{
+			festate->table = (mysql_table *) palloc0(sizeof(mysql_table));
+			festate->table->column = (mysql_column *) palloc0(sizeof(mysql_column) * tupleDescriptor->natts);
+			festate->table->mysql_bind = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * tupleDescriptor->natts);
+
+			festate->table->mysql_res = mysql_stmt_result_metadata(festate->stmt);
+			if (NULL == festate->table->mysql_res)
+				mysql_error_print(festate->conn, "failed to retrieve query result set metadata");
+
+			festate->table->mysql_fields = mysql_fetch_fields(festate->table->mysql_res);
+
+			foreach(lc, festate->retrieved_attrs)
+			{
+				int			attnum = lfirst_int(lc) - 1;
+				Oid			pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+				int32		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
+
+				if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
+					continue;
+
+				festate->table->column[atindex].mysql_bind = &festate->table->mysql_bind[atindex];
+
+				mysql_bind_result(pgtype, pgtypmod,
+								&festate->table->mysql_fields[atindex],
+								&festate->table->column[atindex]);
+				atindex++;
+			}
+
+			/* Bind the results pointers for the prepare statements */
+			if (mysql_stmt_bind_result(festate->stmt, festate->table->mysql_bind) != 0)
+				mysql_error_print(festate->conn, "failed to bind the MySQL query");
+		}
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler if we managed to create one */
+		mysql_close_stmt_handler(festate->conn, festate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -931,107 +986,126 @@ mysqlIterateForeignScan(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 	TupleTableSlot *tupleSlot = node->ss.ss_ScanTupleSlot;
-	int			attid;
-	ListCell   *lc;
-	int			rc = 0;
-	Datum	   *dvalues;
-	bool	   *nulls;
-	int			natts;
-	AttInMetadata *attinmeta = festate->attinmeta;
-	HeapTuple	tup;
-	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
-	List	   *fdw_private = fsplan->fdw_private;
-
-	natts = attinmeta->tupdesc->natts;
-
-	dvalues = palloc0(natts * sizeof(Datum));
-	nulls = palloc(natts * sizeof(bool));
-	/* Initialize to nulls for any columns not present in result */
-	memset(nulls, true, natts * sizeof(bool));
-
-	ExecClearTuple(tupleSlot);
 
 	/*
-	 * If this is the first call after Begin or ReScan, we need to bind the
-	 * params and execute the query.
+	 * Use PG_TRY block to ensure closing the MySQL statement handler on any error.
 	 */
-	if (!festate->query_executed)
-		bind_stmt_params_and_exec(node);
-
-	attid = 0;
-	rc = mysql_stmt_fetch(festate->stmt);
-
-	if (rc == 0)
+	PG_TRY();
 	{
-		foreach(lc, festate->retrieved_attrs)
-		{
-			int			attnum = lfirst_int(lc) - 1;
-			Oid			pgtype = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypid;
-			int32		pgtypmod = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypmod;
+		AttInMetadata *attinmeta = festate->attinmeta;
+		ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+		List	   *fdw_private = fsplan->fdw_private;
+		ListCell   *lc;
+		HeapTuple	tup;
+		int			attid;
+		int			rc = 0;
+		Datum	   *dvalues;
+		bool	   *nulls;
+		int			natts;
 
-			nulls[attnum] = festate->table->column[attid].is_null;
-			if (!festate->table->column[attid].is_null)
-				dvalues[attnum] = mysql_convert_to_pg(pgtype,
-													  pgtypmod,
-													  &festate->table->column[attid],
-													  festate->table->mysql_fields[attid]);
+		natts = attinmeta->tupdesc->natts;
 
-			attid++;
-		}
+		dvalues = palloc0(natts * sizeof(Datum));
+		nulls = palloc(natts * sizeof(bool));
+		/* Initialize to nulls for any columns not present in result */
+		memset(nulls, true, natts * sizeof(bool));
 
 		ExecClearTuple(tupleSlot);
 
-		if (list_length(fdw_private) >= mysqlFdwPrivateScanTList)
-		{
-			/* Construct tuple with whole-row references. */
-			tup = mysql_get_tuple_with_whole_row(festate, dvalues, nulls);
-		}
-		else
-		{
-			/* Form the Tuple using Datums */
-			tup = heap_form_tuple(attinmeta->tupdesc, dvalues, nulls);
-		}
+		/*
+		* If this is the first call after Begin or ReScan, we need to bind the
+		* params and execute the query.
+		*/
+		if (!festate->query_executed)
+			bind_stmt_params_and_exec(node);
 
-		if (tup)
+		attid = 0;
+		rc = mysql_stmt_fetch(festate->stmt);
+
+		if (rc == 0)
+		{
+			foreach(lc, festate->retrieved_attrs)
+			{
+				int			attnum = lfirst_int(lc) - 1;
+				Oid			pgtype = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypid;
+				int32		pgtypmod = TupleDescAttr(attinmeta->tupdesc, attnum)->atttypmod;
+
+				nulls[attnum] = festate->table->column[attid].is_null;
+				if (!festate->table->column[attid].is_null)
+					dvalues[attnum] = mysql_convert_to_pg(pgtype,
+														pgtypmod,
+														&festate->table->column[attid],
+														festate->table->mysql_fields[attid]);
+
+				attid++;
+			}
+
+			ExecClearTuple(tupleSlot);
+
+			if (list_length(fdw_private) >= mysqlFdwPrivateScanTList)
+			{
+				/* Construct tuple with whole-row references. */
+				tup = mysql_get_tuple_with_whole_row(festate, dvalues, nulls);
+			}
+			else
+			{
+				/* Form the Tuple using Datums */
+				tup = heap_form_tuple(attinmeta->tupdesc, dvalues, nulls);
+			}
+
+			if (tup)
 #if PG_VERSION_NUM >= 120000
-			ExecStoreHeapTuple(tup, tupleSlot, false);
+				ExecStoreHeapTuple(tup, tupleSlot, false);
 #else
-			ExecStoreTuple(tup, tupleSlot, InvalidBuffer, false);
+				ExecStoreTuple(tup, tupleSlot, InvalidBuffer, false);
 #endif
-		else
-			mysql_stmt_close(festate->stmt);
+			else
+			{
+				mysql_stmt_close(festate->stmt);
+				festate->stmt = NULL;
+			}
 
-		/*
-		 * Release locally palloc'd space dvalues and nulls is process by
-		 * memory context
-		 */
+			/*
+			 * Release locally palloc'd space dvalues and nulls is process by
+			 * memory context
+			 */
 
+		}
+		else if (rc == 1)
+		{
+			/*
+			 * Error occurred. Error code and message can be obtained by calling
+			 * mysql_stmt_errno() and mysql_stmt_error().
+			 */
+			mysql_error_print(festate->conn, "failed to get the next row in the result set");
+		}
+		else if (rc == MYSQL_NO_DATA)
+		{
+			/*
+			* No more rows/data exists
+			*/
+		}
+		else if (rc == MYSQL_DATA_TRUNCATED)
+		{
+			/* Data truncation occurred */
+			/*
+			 * MYSQL_DATA_TRUNCATED is returned when truncation reporting is
+			 * enabled. To determine which column values were truncated when this
+			 * value is returned, check the error members of the MYSQL_BIND
+			 * structures used for fetching values. Truncation reporting is
+			 * enabled by default, but can be controlled by calling
+			 * mysql_options() with the MYSQL_REPORT_DATA_TRUNCATION option.
+			 */
+		}
 	}
-	else if (rc == 1)
+	PG_CATCH();
 	{
-		/*
-		 * Error occurred. Error code and message can be obtained by calling
-		 * mysql_stmt_errno() and mysql_stmt_error().
-		 */
+		/* Release MYSQL statement handler if we managed to create one */
+		mysql_close_stmt_handler(festate->conn, festate->stmt);
+
+		PG_RE_THROW();
 	}
-	else if (rc == MYSQL_NO_DATA)
-	{
-		/*
-		 * No more rows/data exists
-		 */
-	}
-	else if (rc == MYSQL_DATA_TRUNCATED)
-	{
-		/* Data truncation occurred */
-		/*
-		 * MYSQL_DATA_TRUNCATED is returned when truncation reporting is
-		 * enabled. To determine which column values were truncated when this
-		 * value is returned, check the error members of the MYSQL_BIND
-		 * structures used for fetching values. Truncation reporting is
-		 * enabled by default, but can be controlled by calling
-		 * mysql_options() with the MYSQL_REPORT_DATA_TRUNCATION option.
-		 */
-	}
+	PG_END_TRY();
 
 	return tupleSlot;
 }
@@ -1053,7 +1127,11 @@ mysqlExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	if (fsplan->scan.scanrelid > 0)
 		rtindex = fsplan->scan.scanrelid;
 	else
+#if PG_VERSION_NUM < 160000
 		rtindex = bms_next_member(fsplan->fs_relids, -1);
+#else
+		rtindex = bms_next_member(fsplan->fs_base_relids, -1);
+#endif
 	rte = exec_rt_fetch(rtindex, estate);
 
 	if (list_length(fdw_private) > mysqlFdwScanPrivateRelations)
@@ -1147,7 +1225,7 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	MYSQL	   *conn;
 	Bitmapset  *attrs_used = NULL;
 	mysql_opt  *options;
-	Oid			userid = GetUserId();
+	Oid			userid;
 	ForeignServer *server;
 	UserMapping *user;
 	ForeignTable *table;
@@ -1157,10 +1235,16 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	const char *database;
 	const char *relname;
 	const char *refname;
-	char		sql_mode[255];
+	StringInfoData		sql_mode;
 
 	fpinfo = (MySQLFdwRelationInfo *) palloc0(sizeof(MySQLFdwRelationInfo));
 	baserel->fdw_private = (void *) fpinfo;
+
+#if PG_VERSION_NUM < 160000
+	userid = GetUserId();
+#else
+	userid = OidIsValid(baserel->userid) ? baserel->userid : GetUserId();
+#endif
 
 	table = GetForeignTable(foreigntableid);
 	server = GetForeignServer(table->serverid);
@@ -1172,10 +1256,11 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	/* Connect to the server */
 	conn = mysql_get_connection(server, user, options);
 
-	snprintf(sql_mode, sizeof(sql_mode), "SET sql_mode = '%s'",
-			 options->sql_mode);
-	if (mysql_query(conn, sql_mode) != 0)
-		mysql_error_print(conn);
+	/* Build the SET query */
+	initStringInfo(&sql_mode);
+	appendStringInfo(&sql_mode, "SET sql_mode = '%s'", options->sql_mode);
+	if (mysql_query(conn, sql_mode.data) != 0)
+		mysql_error_print(conn, NULL);
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
@@ -1205,7 +1290,11 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	 */
 	if (fpinfo->use_remote_estimate)
 	{
-		Oid			userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#if PG_VERSION_NUM < 160000
+		userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+		userid = OidIsValid(baserel->userid) ? baserel->userid : GetUserId();
+#endif
 
 		fpinfo->user = GetUserMapping(userid, fpinfo->server->serverid);
 	}
@@ -1362,13 +1451,12 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 static bool
-mysql_is_column_unique(Oid foreigntableid)
+mysql_is_column_unique(Oid foreigntableid, Oid userid)
 {
 	StringInfoData sql;
 	MYSQL	   *conn;
 	MYSQL_RES  *result;
 	mysql_opt  *options;
-	Oid			userid = GetUserId();
 	ForeignServer *server;
 	UserMapping *user;
 	ForeignTable *table;
@@ -1394,7 +1482,7 @@ mysql_is_column_unique(Oid foreigntableid)
 					 mysql_quote_identifier(options->svr_database, '`'),
 					 mysql_quote_identifier(options->svr_table, '`'));
 	if (mysql_query(conn, sql.data) != 0)
-		mysql_error_print(conn);
+		mysql_error_print(conn, NULL);
 
 	result = mysql_store_result(conn);
 	if (result)
@@ -1409,11 +1497,13 @@ mysql_is_column_unique(Oid foreigntableid)
 				if ((strcmp(row[3], "PRI") == 0) || (strcmp(row[3], "UNI")) == 0)
 				{
 					mysql_free_result(result);
+					result = NULL;
 					return true;
 				}
 			}
 		}
 		mysql_free_result(result);
+		result = NULL;
 	}
 
 	return false;
@@ -2013,7 +2103,7 @@ mysqlAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func,
 	mysql_deparse_analyze(&sql, options->svr_database, options->svr_table);
 
 	if (mysql_query(conn, sql.data) != 0)
-		mysql_error_print(conn);
+		mysql_error_print(conn, NULL);
 
 	result = mysql_store_result(conn);
 
@@ -2036,6 +2126,7 @@ mysqlAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func,
 		row = mysql_fetch_row(result);
 		table_size = atof(row[0]);
 		mysql_free_result(result);
+		result = NULL;
 	}
 
 	*totalpages = table_size / MYSQL_BLKSIZ;
@@ -2063,6 +2154,7 @@ mysqlPlanForeignModify(PlannerInfo *root,
 #if PG_VERSION_NUM >= 140000
 	int			values_end_len = -1;
 #endif
+	Oid			userid;
 
 	initStringInfo(&sql);
 
@@ -2074,10 +2166,31 @@ mysqlPlanForeignModify(PlannerInfo *root,
 
 	foreignTableId = RelationGetRelid(rel);
 
-	if (!mysql_is_column_unique(foreignTableId))
+	/*
+	 * For foreign update and delete PostgreSQL require a unique column to do that
+	 * operations. The postgres_fdw uses ctid to uniquely identify row to perform
+	 * foreign delete/update. But in mysql_fdw we don't have hidden column like
+	 * that so we make a requirement for first column to be unique. We are using
+	 * first column to uniquely identify the rows for UPDATE/DELETE operation.
+	 */
+#if PG_VERSION_NUM < 160000
+	userid = GetUserId();
+#else
+	if (rte->perminfoindex != 0)
+	{
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos, rte);
+
+		userid = (perminfo != NULL && OidIsValid(perminfo->checkAsUser))? perminfo->checkAsUser : GetUserId();
+	}
+	else
+		userid = GetUserId();
+#endif
+
+	if ((operation == CMD_UPDATE || operation == CMD_DELETE)
+		&& !mysql_is_column_unique(foreignTableId, userid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("first column of remote table must be unique for INSERT/UPDATE/DELETE operation")));
+				 errmsg("first column of remote table must be unique for UPDATE/DELETE operation")));
 
 	/*
 	 * ON CONFLICT DO UPDATE and DO NOTHING case with inference specification
@@ -2110,13 +2223,6 @@ mysqlPlanForeignModify(PlannerInfo *root,
 		TupleDesc	tupdesc = RelationGetDescr(rel);
 		int			attnum;
 
-		/*
-		 * If it is an UPDATE operation, check for row identifier column in
-		 * target attribute list by calling getUpdateTargetAttrs().
-		 */
-		if (operation == CMD_UPDATE)
-			getUpdateTargetAttrs(rte);
-
 		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
 			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
@@ -2127,7 +2233,14 @@ mysqlPlanForeignModify(PlannerInfo *root,
 	}
 	else if (operation == CMD_UPDATE)
 	{
+#if (PG_VERSION_NUM >= 130010 && PG_VERSION_NUM < 140000) || \
+	(PG_VERSION_NUM >= 140007 && PG_VERSION_NUM < 150000) || \
+	(PG_VERSION_NUM >= 150002)
+		targetAttrs = getUpdateTargetAttrs(root, resultRelation);
+#else
 		targetAttrs = getUpdateTargetAttrs(rte);
+#endif
+
 		/* We also want the rowid column to be available for the update */
 		targetAttrs = lcons_int(1, targetAttrs);
 	}
@@ -2215,7 +2328,9 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 	bool		isvarlena = false;
 	ListCell   *lc;
 	Oid			foreignTableId = InvalidOid;
+#if PG_VERSION_NUM < 160000
 	RangeTblEntry *rte;
+#endif
 	Oid			userid;
 	ForeignServer *server;
 	UserMapping *user;
@@ -2231,10 +2346,13 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
+#if PG_VERSION_NUM < 160000
 	rte = exec_rt_fetch(resultRelInfo->ri_RangeTableIndex,
 						mtstate->ps.state);
-
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	userid = ExecGetResultRelCheckAsUser(resultRelInfo, estate);
+#endif
 
 	foreignTableId = RelationGetRelid(rel);
 
@@ -2310,19 +2428,6 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 	}
 	Assert(fmstate->p_nums <= n_params);
 
-	/* Initialize mysql statement */
-	fmstate->stmt = mysql_stmt_init(fmstate->conn);
-	if (!fmstate->stmt)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to initialize the MySQL query: \n%s",
-						mysql_error(fmstate->conn))));
-
-	/* Prepare mysql statment */
-	if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
-						   strlen(fmstate->query)) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to prepare the MySQL query");
-
 	/* Initialize auxiliary state */
 	fmstate->aux_fmstate = NULL;
 
@@ -2340,6 +2445,33 @@ mysqlBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->num_slots = 1;
 #endif
 
+	/*
+	 * Initialize mysql statement
+	 *
+	 * Make sure to close the MySQL statement handler if any error,
+	 * so put this init at end of this function, we don't need to
+	 * worry errors which are not errors of mysql's lib.
+	 */
+	fmstate->stmt = mysql_stmt_init(fmstate->conn);
+	if (!fmstate->stmt)
+		mysql_error_print(fmstate->conn, "failed to initialize the MySQL statement handler");
+
+	PG_TRY();
+	{
+		/* Prepare mysql statement */
+		if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
+								strlen(fmstate->query)) != 0)
+			mysql_error_print(fmstate->conn, "failed to prepare the MySQL query");
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler data structure if we managed to create one */
+		mysql_close_stmt_handler(fmstate->conn, fmstate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	resultRelInfo->ri_FdwState = fmstate;
 }
 
@@ -2350,91 +2482,109 @@ mysql_execute_foreign_insert(EState *estate,
 							 TupleTableSlot **planSlot,
 							 int *numSlots)
 {
-	MySQLFdwExecState *fmstate;
-	MYSQL_BIND *mysql_bind_buffer;
-	ListCell   *lc;
-	int		    n_params;
-	MemoryContext oldcontext;
-	bool	   *isnull;
-	char	    sql_mode[255];
-	Oid		    foreignTableId = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-#if PG_VERSION_NUM >= 140000
-	StringInfoData sql;
-#endif
-	int		    i;
-	int		    bindnum = 0;
+	MySQLFdwExecState *fmstate = (MySQLFdwExecState *) resultRelInfo->ri_FdwState;
 
-	fmstate = (MySQLFdwExecState *) resultRelInfo->ri_FdwState;
-	n_params = list_length(fmstate->retrieved_attrs);
-
-	fmstate->mysqlFdwOptions = mysql_get_options(foreignTableId, true);
-
-	oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
-
-	mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * n_params * *numSlots);
-	isnull = (bool *) palloc0(sizeof(bool) * n_params * *numSlots);
-
-	snprintf(sql_mode, sizeof(sql_mode), "SET sql_mode = '%s'",
-			 fmstate->mysqlFdwOptions->sql_mode);
-	if (mysql_query(fmstate->conn, sql_mode) != 0)
-		mysql_error_print(fmstate->conn);
-
-#if PG_VERSION_NUM >= 140000
-	if (fmstate->num_slots != *numSlots)
+	/*
+	 * Use PG_TRY block to ensure closing the MySQL statement handler on any error.
+	 */
+	PG_TRY();
 	{
-		/*
-		 * Rebuild the prepared statement with all palace holder for batch
-		 * insert case
-		 */
-		if (fmstate && fmstate->stmt)
-			mysql_stmt_close(fmstate->stmt);
-		fmstate->stmt = mysql_stmt_init(fmstate->conn);
-
-		/* Build INSERT string with numSlots records in its VALUES clause. */
-		initStringInfo(&sql);
-		mysql_rebuild_insert_sql(&sql, fmstate->rel,
-								 fmstate->orig_query, fmstate->target_attrs,
-								 fmstate->values_end, fmstate->p_nums,
-								 *numSlots - 1);
-		fmstate->query = sql.data;
-
-		/* Prepare mysql statment */
-		if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
-							   strlen(fmstate->query)) != 0)
-			mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to prepare the MySQL query");
-	}
+		MYSQL_BIND *mysql_bind_buffer;
+		MemoryContext oldcontext;
+		ListCell   *lc;
+		int		    n_params;
+		bool	   *isnull;
+		StringInfoData		sql_mode;
+		Oid		    foreignTableId = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+#if PG_VERSION_NUM >= 140000
+		StringInfoData sql;
 #endif
+		int		    i;
+		int		    bindnum = 0;
 
-	for (i = 0; i < *numSlots; i++)
-	{
-		foreach(lc, fmstate->retrieved_attrs)
+		n_params = list_length(fmstate->retrieved_attrs);
+
+		fmstate->mysqlFdwOptions = mysql_get_options(foreignTableId, true);
+
+		oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
+
+		mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * n_params * *numSlots);
+		isnull = (bool *) palloc0(sizeof(bool) * n_params * *numSlots);
+
+		/* Build the SET query */
+		initStringInfo(&sql_mode);
+		appendStringInfo(&sql_mode, "SET sql_mode = '%s'", fmstate->mysqlFdwOptions->sql_mode);
+		if (mysql_query(fmstate->conn, sql_mode.data) != 0)
+			mysql_error_print(fmstate->conn, NULL);
+
+#if PG_VERSION_NUM >= 140000
+		if (fmstate->num_slots != *numSlots)
 		{
-			int			attnum = lfirst_int(lc) - 1;
-			Oid			type = TupleDescAttr(slots[i]->tts_tupleDescriptor, attnum)->atttypid;
-			Datum		value;
+			/*
+			 * Rebuild the prepared statement with all palace holder for batch
+			 * insert case
+			 */
+			if (fmstate->stmt)
+				mysql_stmt_close(fmstate->stmt);
+			fmstate->stmt = mysql_stmt_init(fmstate->conn);
+			if (!fmstate->stmt)
+				mysql_error_print(fmstate->conn, "failed to initialize the MySQL statement handler");
 
-			/* Use bind num to index sequentially */
-			value = slot_getattr(slots[i], attnum + 1, &isnull[bindnum]);
+			/* Build INSERT string with numSlots records in its VALUES clause. */
+			initStringInfo(&sql);
+			mysql_rebuild_insert_sql(&sql, fmstate->rel,
+									fmstate->orig_query, fmstate->target_attrs,
+									fmstate->values_end, fmstate->p_nums,
+									*numSlots - 1);
+			fmstate->query = sql.data;
 
-			mysql_bind_sql_var(type, bindnum, value, mysql_bind_buffer,
-							   &isnull[bindnum]);
-			bindnum++;
+			/* Prepare mysql statment */
+			if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
+								strlen(fmstate->query)) != 0)
+				mysql_error_print(fmstate->conn, "failed to prepare the MySQL query");
 		}
-	}
+#endif
 
-	/* Bind values */
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to bind the MySQL query");
+		for (i = 0; i < *numSlots; i++)
+		{
+			foreach(lc, fmstate->retrieved_attrs)
+			{
+				int			attnum = lfirst_int(lc) - 1;
+				Oid			type = TupleDescAttr(slots[i]->tts_tupleDescriptor, attnum)->atttypid;
+				Datum		value;
 
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to execute the MySQL query");
+				/* Use bind num to index sequentially */
+				value = slot_getattr(slots[i], attnum + 1, &isnull[bindnum]);
+
+				mysql_bind_sql_var(type, bindnum, value, mysql_bind_buffer,
+								&isnull[bindnum]);
+				bindnum++;
+			}
+		}
+
+		/* Bind values */
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			mysql_error_print(fmstate->conn, "failed to bind the MySQL query");
+
+		/* Execute the query */
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_error_print(fmstate->conn, NULL);
 
 #if PG_VERSION_NUM >= 140000
-	fmstate->num_slots = *numSlots;
+		fmstate->num_slots = *numSlots;
 #endif
-	MemoryContextSwitchTo(oldcontext);
-	MemoryContextReset(fmstate->temp_cxt);
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextReset(fmstate->temp_cxt);
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler if we managed to create one */
+		mysql_close_stmt_handler(fmstate->conn, fmstate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	return slots;
 }
 
@@ -2544,6 +2694,15 @@ mysqlGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 		return 1;
 
 	/*
+	 * If the foreign table has no columns, disable batching as the INSERT
+	 * syntax doesn't allow batching multiple empty rows into a zero-column
+	 * table in a single statement.  This is needed for COPY FROM, in which
+	 * case fmstate must be non-NULL.
+	 */
+	if (fmstate && list_length(fmstate->target_attrs) == 0)
+		return 1;
+
+	/*
 	 * Otherwise use the batch size specified for server/table. The number of
 	 * parameters in a batch is limited to max_prepared_stmt_count() Default
 	 * value is  65535, so make sure we don't exceed this limit by using the
@@ -2562,129 +2721,141 @@ mysqlExecForeignUpdate(EState *estate,
 					   TupleTableSlot *planSlot)
 {
 	MySQLFdwExecState *fmstate = (MySQLFdwExecState *) resultRelInfo->ri_FdwState;
-	Relation	rel = resultRelInfo->ri_RelationDesc;
-	MYSQL_BIND *mysql_bind_buffer;
-	Oid			foreignTableId = RelationGetRelid(rel);
-	bool		is_null = false;
-	ListCell   *lc;
-	int			bindnum = 0;
-	Oid			typeoid;
-	Datum		value;
-	int			n_params;
-	bool	   *isnull;
-	Datum		new_value;
-	HeapTuple	tuple;
-	Form_pg_attribute attr;
-	bool		found_row_id_col = false;
 
-	n_params = list_length(fmstate->retrieved_attrs);
-
-	mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * n_params);
-	isnull = (bool *) palloc0(sizeof(bool) * n_params);
-
-	/* Bind the values */
-	foreach(lc, fmstate->retrieved_attrs)
+	/*
+	 * Use PG_TRY block to ensure closing the MySQL statement handler on any error.
+	 */
+	PG_TRY();
 	{
-		int			attnum = lfirst_int(lc);
-		Oid			type;
+		Relation	rel = resultRelInfo->ri_RelationDesc;
+		MYSQL_BIND *mysql_bind_buffer;
+		Oid			foreignTableId = RelationGetRelid(rel);
+		bool		is_null = false;
+		ListCell   *lc;
+		int			bindnum = 0;
+		Oid			typeoid;
+		Datum		value;
+		int			n_params;
+		bool	   *isnull;
+		Datum		new_value;
+		HeapTuple	tuple;
+		Form_pg_attribute attr;
+		bool		found_row_id_col = false;
+
+		n_params = list_length(fmstate->retrieved_attrs);
+
+		mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * n_params);
+		isnull = (bool *) palloc0(sizeof(bool) * n_params);
+
+		/* Bind the values */
+		foreach(lc, fmstate->retrieved_attrs)
+		{
+			int			attnum = lfirst_int(lc);
+			Oid			type;
 #if PG_VERSION_NUM >= 140000
-		TupleDesc	tupdesc = RelationGetDescr(fmstate->rel);
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+			TupleDesc	tupdesc = RelationGetDescr(fmstate->rel);
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 #endif
+
+			/*
+			 * The first attribute cannot be in the target list attribute.  Set
+			 * the found_row_id_col to true once we find it so that we can fetch
+			 * the value later.
+			 */
+			if (attnum == 1)
+			{
+				found_row_id_col = true;
+				continue;
+			}
+#if PG_VERSION_NUM >= 140000
+			/* Ignore generated columns; they are set to DEFAULT */
+			if (attr->attgenerated)
+				continue;
+#endif
+
+			type = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
+			value = slot_getattr(slot, attnum, (bool *) (&isnull[bindnum]));
+
+			mysql_bind_sql_var(type, bindnum, value, mysql_bind_buffer,
+							&isnull[bindnum]);
+			bindnum++;
+		}
 
 		/*
-		 * The first attribute cannot be in the target list attribute.  Set
-		 * the found_row_id_col to true once we find it so that we can fetch
-		 * the value later.
+		 * Since we add a row identifier column in the target list always, so
+		 * found_row_id_col flag should be true.
 		 */
-		if (attnum == 1)
+		if (!found_row_id_col)
+			elog(ERROR, "mysql_fdw: missing row identifier column value in UPDATE");
+
+		new_value = slot_getattr(slot, 1, &is_null);
+
+		/*
+		 * Get the row identifier column value that was passed up as a resjunk
+		 * column and compare that value with the new value to identify if that
+		 * value is changed.
+		 */
+		value = ExecGetJunkAttribute(planSlot, fmstate->rowidAttno, &is_null);
+
+		tuple = SearchSysCache2(ATTNUM,
+								ObjectIdGetDatum(foreignTableId),
+								Int16GetDatum(1));
+		if (!HeapTupleIsValid(tuple))
 		{
-			found_row_id_col = true;
-			continue;
+			elog(ERROR, "mysql_fdw: cache lookup failed for attribute %d of relation %u",
+				1, foreignTableId);
 		}
-#if PG_VERSION_NUM >= 140000
-		/* Ignore generated columns; they are set to DEFAULT */
-		if (attr->attgenerated)
-			continue;
-#endif
 
-		type = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
-		value = slot_getattr(slot, attnum, (bool *) (&isnull[bindnum]));
+		attr = (Form_pg_attribute) GETSTRUCT(tuple);
+		typeoid = attr->atttypid;
 
-		mysql_bind_sql_var(type, bindnum, value, mysql_bind_buffer,
-						   &isnull[bindnum]);
-		bindnum++;
+		if (DatumGetPointer(new_value) != NULL && DatumGetPointer(value) != NULL)
+		{
+			Datum		n_value = new_value;
+			Datum		o_value = value;
+
+			/* If the attribute type is varlena then need to detoast the datums. */
+			if (attr->attlen == -1)
+			{
+				n_value = PointerGetDatum(PG_DETOAST_DATUM(new_value));
+				o_value = PointerGetDatum(PG_DETOAST_DATUM(value));
+			}
+
+			if (!datumIsEqual(o_value, n_value, attr->attbyval, attr->attlen))
+				mysql_error_print(fmstate->conn, "row identifier column update is not supported");
+
+			/* Free memory if it's a copy made above */
+			if (DatumGetPointer(n_value) != DatumGetPointer(new_value))
+				pfree(DatumGetPointer(n_value));
+			if (DatumGetPointer(o_value) != DatumGetPointer(value))
+				pfree(DatumGetPointer(o_value));
+		}
+		else if (!(DatumGetPointer(new_value) == NULL &&
+				DatumGetPointer(value) == NULL))
+			{
+				mysql_error_print(fmstate->conn, "row identifier column update is not supported");
+			}
+
+		ReleaseSysCache(tuple);
+
+		/* Bind qual */
+		mysql_bind_sql_var(typeoid, bindnum, value, mysql_bind_buffer, &is_null);
+
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			mysql_error_print(fmstate->conn, "failed to bind the MySQL query");
+
+		/* Execute the query */
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_error_print(fmstate->conn, NULL);
 	}
-
-	/*
-	 * Since we add a row identifier column in the target list always, so
-	 * found_row_id_col flag should be true.
-	 */
-	if (!found_row_id_col)
-		elog(ERROR, "missing row identifier column value in UPDATE");
-
-	new_value = slot_getattr(slot, 1, &is_null);
-
-	/*
-	 * Get the row identifier column value that was passed up as a resjunk
-	 * column and compare that value with the new value to identify if that
-	 * value is changed.
-	 */
-	value = ExecGetJunkAttribute(planSlot, fmstate->rowidAttno, &is_null);
-
-	tuple = SearchSysCache2(ATTNUM,
-							ObjectIdGetDatum(foreignTableId),
-							Int16GetDatum(1));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
-			 1, foreignTableId);
-
-	attr = (Form_pg_attribute) GETSTRUCT(tuple);
-	typeoid = attr->atttypid;
-
-	if (DatumGetPointer(new_value) != NULL && DatumGetPointer(value) != NULL)
+	PG_CATCH();
 	{
-		Datum		n_value = new_value;
-		Datum		o_value = value;
+		/* Release MYSQL statement handler if we managed to create one */
+		mysql_close_stmt_handler(fmstate->conn, fmstate->stmt);
 
-		/* If the attribute type is varlena then need to detoast the datums. */
-		if (attr->attlen == -1)
-		{
-			n_value = PointerGetDatum(PG_DETOAST_DATUM(new_value));
-			o_value = PointerGetDatum(PG_DETOAST_DATUM(value));
-		}
-
-		if (!datumIsEqual(o_value, n_value, attr->attbyval, attr->attlen))
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("row identifier column update is not supported")));
-
-		/* Free memory if it's a copy made above */
-		if (DatumGetPointer(n_value) != DatumGetPointer(new_value))
-			pfree(DatumGetPointer(n_value));
-		if (DatumGetPointer(o_value) != DatumGetPointer(value))
-			pfree(DatumGetPointer(o_value));
+		PG_RE_THROW();
 	}
-	else if (!(DatumGetPointer(new_value) == NULL &&
-			   DatumGetPointer(value) == NULL))
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("row identifier column update is not supported")));
-
-	ReleaseSysCache(tuple);
-
-	/* Bind qual */
-	mysql_bind_sql_var(typeoid, bindnum, value, mysql_bind_buffer, &is_null);
-
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to bind the MySQL query: %s",
-						mysql_error(fmstate->conn))));
-
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to execute the MySQL query");
+	PG_END_TRY();
 
 	/* Return NULL if nothing was updated on the remote end */
 	return slot;
@@ -2760,31 +2931,43 @@ mysqlExecForeignDelete(EState *estate,
 					   TupleTableSlot *planSlot)
 {
 	MySQLFdwExecState *fmstate = (MySQLFdwExecState *) resultRelInfo->ri_FdwState;
-	Relation	rel = resultRelInfo->ri_RelationDesc;
-	MYSQL_BIND *mysql_bind_buffer;
-	Oid			foreignTableId = RelationGetRelid(rel);
-	bool		is_null = false;
-	Oid			typeoid;
-	Datum		value;
 
-	mysql_bind_buffer = (MYSQL_BIND *) palloc(sizeof(MYSQL_BIND));
+	/*
+	 * Use PG_TRY block to ensure closing MYSQL statement handler on any error.
+	 */
+	PG_TRY();
+	{
+		Relation	rel = resultRelInfo->ri_RelationDesc;
+		MYSQL_BIND *mysql_bind_buffer;
+		Oid			foreignTableId = RelationGetRelid(rel);
+		bool		is_null = false;
+		Oid			typeoid;
+		Datum		value;
 
-	/* Get the id that was passed up as a resjunk column */
-	value = ExecGetJunkAttribute(planSlot, 1, &is_null);
-	typeoid = get_atttype(foreignTableId, 1);
+		mysql_bind_buffer = (MYSQL_BIND *) palloc(sizeof(MYSQL_BIND));
 
-	/* Bind qual */
-	mysql_bind_sql_var(typeoid, 0, value, mysql_bind_buffer, &is_null);
+		/* Get the id that was passed up as a resjunk column */
+		value = ExecGetJunkAttribute(planSlot, 1, &is_null);
+		typeoid = get_atttype(foreignTableId, 1);
 
-	if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to execute the MySQL query: %s",
-						mysql_error(fmstate->conn))));
+		/* Bind qual */
+		mysql_bind_sql_var(typeoid, 0, value, mysql_bind_buffer, &is_null);
 
-	/* Execute the query */
-	if (mysql_stmt_execute(fmstate->stmt) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to execute the MySQL query");
+		if (mysql_stmt_bind_param(fmstate->stmt, mysql_bind_buffer) != 0)
+			mysql_error_print(fmstate->conn, "failed to bind the MySQL query");
+
+		/* Execute the query */
+		if (mysql_stmt_execute(fmstate->stmt) != 0)
+			mysql_error_print(fmstate->conn, NULL);
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler data structure if we managed to create one */
+		mysql_close_stmt_handler(fmstate->conn, fmstate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Return NULL if nothing was updated on the remote end */
 	return slot;
@@ -2797,12 +2980,12 @@ mysqlExecForeignDelete(EState *estate,
 static void
 mysqlEndForeignModify(EState *estate, ResultRelInfo *resultRelInfo)
 {
-	MySQLFdwExecState *festate = resultRelInfo->ri_FdwState;
+	MySQLFdwExecState *fmstate = resultRelInfo->ri_FdwState;
 
-	if (festate && festate->stmt)
+	if (fmstate && fmstate->stmt)
 	{
-		mysql_stmt_close(festate->stmt);
-		festate->stmt = NULL;
+		mysql_stmt_close(fmstate->stmt);
+		fmstate->stmt = NULL;
 	}
 }
 
@@ -2861,7 +3044,11 @@ find_modifytable_subplan(PlannerInfo *root,
 	{
 		ForeignScan *fscan = (ForeignScan *) subplan;
 
+#if PG_VERSION_NUM >= 160000
+		if (bms_is_member(rtindex, fscan->fs_base_relids))
+#else
 		if (bms_is_member(rtindex, fscan->fs_relids))
+#endif
 			return fscan;
 	}
 
@@ -2899,6 +3086,7 @@ mysqlPlanDirectModify(PlannerInfo *root,
 	List	   *params_list = NIL;
 	List	   *retrieved_attrs = NIL;
 	Oid			foreignTableId;
+	Oid			userid;
 
 	/*
 	 * Decide whether it is safe to modify a foreign table directly.
@@ -3041,10 +3229,23 @@ mysqlPlanDirectModify(PlannerInfo *root,
 	 * Similar as mysqlPlanForeignModify, check the first column of remote
 	 * table is unique or not
 	 */
-	if (!mysql_is_column_unique(foreignTableId))
+#if PG_VERSION_NUM < 160000
+	userid = GetUserId();
+#else
+	if (rte->perminfoindex != 0)
+	{
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos, rte);
+
+		userid = (perminfo != NULL && OidIsValid(perminfo->checkAsUser))? perminfo->checkAsUser : GetUserId();
+	}
+	else
+		userid = GetUserId();
+#endif
+
+	if (!mysql_is_column_unique(foreignTableId, userid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("first column of remote table must be unique for INSERT/UPDATE/DELETE operation")));
+				 errmsg("first column of remote table must be unique for UPDATE/DELETE operation")));
 
 	/*
 	 * Recall the qual clauses that must be evaluated remotely.  (These are
@@ -3139,7 +3340,9 @@ mysqlBeginDirectModify(ForeignScanState *node, int eflags)
 	EState	   *estate = node->ss.ps.state;
 	MySQLFdwDirectModifyState *dmstate;
 	Index		rtindex;
+#if PG_VERSION_NUM < 160000
 	RangeTblEntry *rte;
+#endif	
 	Oid			userid;
 	ForeignTable *table;
 	ForeignServer *server;
@@ -3170,9 +3373,12 @@ mysqlBeginDirectModify(ForeignScanState *node, int eflags)
 	rtindex = estate->es_result_relation_info->ri_RangeTableIndex;
 #endif
 
+#if PG_VERSION_NUM < 160000
 	rte = exec_rt_fetch(rtindex, estate);
-
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	userid = ExecGetResultRelCheckAsUser(node->resultRelInfo, estate);
+#endif
 
 	/* Get info about foreign table. */
 	if (fsplan->scan.scanrelid == 0)
@@ -3234,18 +3440,6 @@ mysqlBeginDirectModify(ForeignScanState *node, int eflags)
 											  "mysql_fdw temporary data",
 											  ALLOCSET_SMALL_SIZES);
 
-	/* Initialize the MySQL statement */
-	dmstate->stmt = mysql_stmt_init(dmstate->conn);
-	if (dmstate->stmt == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to initialize the mysql query: \n%s",
-						mysql_error(dmstate->conn))));
-
-	/* Prepare mysql statement */
-	if (mysql_stmt_prepare(dmstate->stmt, dmstate->query, strlen(dmstate->query)) != 0)
-		mysql_stmt_error_print(dmstate->conn, dmstate->stmt, "failed to prepare the MySQL query");
-
 	/*
 	 * Prepare for processing of parameters used in remote query, if any.
 	 */
@@ -3259,6 +3453,32 @@ mysqlBeginDirectModify(ForeignScanState *node, int eflags)
 							 &dmstate->param_exprs,
 							 &dmstate->param_values,
 							 &dmstate->param_types);
+
+	/*
+	 * Initialize mysql statement
+	 *
+	 * Make sure to close the MySQL statement handler if any error,
+	 * so put this init at end of this function, we don't need to
+	 * worry errors which are not errors of mysql's lib.
+	 */
+	dmstate->stmt = mysql_stmt_init(dmstate->conn);
+	if (dmstate->stmt == NULL)
+		mysql_error_print(dmstate->conn, "failed to initialize the MySQL statement handler");
+
+	PG_TRY();
+	{
+		/* Prepare mysql statement */
+		if (mysql_stmt_prepare(dmstate->stmt, dmstate->query, strlen(dmstate->query)) != 0)
+			mysql_error_print(dmstate->conn, "failed to prepare the MySQL query");
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler data structure if we managed to create one */
+		mysql_close_stmt_handler(dmstate->conn, dmstate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -3305,12 +3525,11 @@ mysqlEndDirectModify(ForeignScanState *node)
 	if (dmstate == NULL)
 		return;
 
-	if (dmstate && dmstate->stmt)
+	if (dmstate->stmt)
 	{
 		mysql_stmt_close(dmstate->stmt);
 		dmstate->stmt = NULL;
 	}
-
 }
 
 static void
@@ -3522,7 +3741,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					 stmt->remote_schema);
 
 	if (mysql_query(conn, buf.data) != 0)
-		mysql_error_print(conn);
+		mysql_error_print(conn, NULL);
 
 	res = mysql_store_result(conn);
 	if (!res || mysql_num_rows(res) < 1)
@@ -3555,6 +3774,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					 "    WHEN c.DATA_TYPE = 'double' THEN 'double precision'"
 					 "    WHEN c.DATA_TYPE = 'float' THEN 'real'"
 					 "    WHEN c.DATA_TYPE = 'datetime' THEN 'timestamp'"
+					 "    WHEN c.DATA_TYPE = 'timestamp' THEN 'timestamptz'"
 					 "    WHEN c.DATA_TYPE = 'longtext' THEN 'text'"
 					 "    WHEN c.DATA_TYPE = 'mediumtext' THEN 'text'"
 					 "    WHEN c.DATA_TYPE = 'tinytext' THEN 'text'"
@@ -3615,7 +3835,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 	/* Fetch the data */
 	if (mysql_query(conn, buf.data) != 0)
-		mysql_error_print(conn);
+		mysql_error_print(conn, NULL);
 
 	res = mysql_store_result(conn);
 	row = mysql_fetch_row(res);
@@ -3890,7 +4110,12 @@ mysqlBeginForeignInsert(ModifyTableState *mtstate,
 #endif
 
 	/* Begin constructing MySQLFdwExecState. */
+#if PG_VERSION_NUM < 160000
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	userid = ExecGetResultRelCheckAsUser(resultRelInfo, estate);
+#endif
+
 	foreignTableId = RelationGetRelid(rel);
 	table = GetForeignTable(foreignTableId);
 	server = GetForeignServer(table->serverid);
@@ -3928,19 +4153,6 @@ mysqlBeginForeignInsert(ModifyTableState *mtstate,
 	}
 	Assert(fmstate->p_nums <= n_params);
 
-	/* Initialize mysql statment */
-	fmstate->stmt = mysql_stmt_init(fmstate->conn);
-	if (!fmstate->stmt)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to initialize the MySQL query: \n%s",
-						mysql_error(fmstate->conn))));
-
-	/* Prepare mysql statment */
-	if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
-						   strlen(fmstate->query)) != 0)
-		mysql_stmt_error_print(fmstate->conn, fmstate->stmt, "failed to prepare the MySQL query");
-
 #if PG_VERSION_NUM >= 140000
 	fmstate->query = pstrdup(fmstate->query);
 	fmstate->orig_query = pstrdup(fmstate->query);
@@ -3965,6 +4177,33 @@ mysqlBeginForeignInsert(ModifyTableState *mtstate,
 	}
 	else
 		resultRelInfo->ri_FdwState = fmstate;
+
+	/*
+	 * Initialize mysql statement
+	 *
+	 * Make sure to close the MySQL statement handler if any error,
+	 * so put this init at end of this function, we don't need to
+	 * worry errors which are not errors of mysql's lib.
+	 */
+	fmstate->stmt = mysql_stmt_init(fmstate->conn);
+	if (!fmstate->stmt)
+		mysql_error_print(fmstate->conn, "failed to initialize the MySQL statement handler");
+
+	PG_TRY();
+	{
+		/* Prepare mysql statment */
+		if (mysql_stmt_prepare(fmstate->stmt, fmstate->query,
+							strlen(fmstate->query)) != 0)
+			mysql_error_print(fmstate->conn, "failed to prepare the MySQL query");
+	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler data structure if we managed to create one */
+		mysql_close_stmt_handler(fmstate->conn, fmstate->stmt);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -4152,6 +4391,9 @@ process_query_params(ExprContext *econtext,
 /*
  * Process the query params and bind the same with the statement, if any.
  * Also, execute the statement.
+ *
+ * On any error, be sure to release the MySQL statement handler on the way out.
+ * Callers must have PG_CATCH block to release the statement handler.
  */
 static void
 bind_stmt_params_and_exec(ForeignScanState *node)
@@ -4182,7 +4424,8 @@ bind_stmt_params_and_exec(ForeignScanState *node)
 							 &mysql_bind_buffer,
 							 festate->param_types);
 
-		mysql_stmt_bind_param(festate->stmt, mysql_bind_buffer);
+		if (mysql_stmt_bind_param(festate->stmt, mysql_bind_buffer) != 0)
+			mysql_error_print(festate->conn, "failed to bind the MySQL query");
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -4192,49 +4435,53 @@ bind_stmt_params_and_exec(ForeignScanState *node)
 	 * already bind.
 	 */
 	if (mysql_stmt_execute(festate->stmt) != 0)
+		mysql_error_print(festate->conn, NULL);
+
+	/* Check the results of query has warning or not */
+	if (mysql_warning_count(festate->conn) > 0)
 	{
-		mysql_stmt_error_print(festate->conn, festate->stmt, "failed to execute the MySQL query");
-	}
-	else
-	{
-		/* Check the results of query has warning or not */
-		if (mysql_warning_count(festate->conn) > 0)
+		MYSQL_RES  *result = NULL;
+
+		if (mysql_query(festate->conn, "SHOW WARNINGS"))
+			mysql_error_print(festate->conn, NULL);
+
+		result = mysql_store_result(festate->conn);
+		if (result)
 		{
-			MYSQL_RES  *result = NULL;
+			/*
+			 * MySQL provide numbers of rows per table invole in the
+			 * statment, but we don't have problem with it because we are
+			 * sending separate query per table in FDW.
+			 */
+			MYSQL_ROW	row;
+			unsigned int num_fields;
+			unsigned int i;
 
-			if (mysql_query(festate->conn, "SHOW WARNINGS"))
+			num_fields = mysql_num_fields(result);
+			while ((row = mysql_fetch_row(result)))
 			{
-				mysql_error_print(festate->conn);
-			}
-			result = mysql_store_result(festate->conn);
-			if (result)
-			{
-				/*
-				 * MySQL provide numbers of rows per table invole in the
-				 * statment, but we don't have problem with it because we are
-				 * sending separate query per table in FDW.
-				 */
-				MYSQL_ROW	row;
-				unsigned int num_fields;
-				unsigned int i;
-
-				num_fields = mysql_num_fields(result);
-				while ((row = mysql_fetch_row(result)))
+				for (i = 0; i < num_fields; i++)
 				{
-					for (i = 0; i < num_fields; i++)
+					/* Check warning of query */
+					if (strcmp(row[i], "Division by 0") == 0)
 					{
-						/* Check warning of query */
-						if (strcmp(row[i], "Division by 0") == 0)
-							ereport(ERROR,
-									(errcode(ERRCODE_DIVISION_BY_ZERO),
-									 errmsg("division by zero")));
+						mysql_free_result(result);
+						result = NULL;
+						ereport(ERROR,
+								(errcode(ERRCODE_DIVISION_BY_ZERO),
+									errmsg("division by zero")));
 					}
 				}
-				mysql_free_result(result);
 			}
+			mysql_free_result(result);
+			result = NULL;
+		}
+		else if (*mysql_error(festate->conn))
+		{
+			/* An error occured */
+			mysql_error_print(festate->conn, "fail to create result set for SHOW WARNINGS query");
 		}
 	}
-
 
 	/* Mark the query as executed */
 	festate->query_executed = true;
@@ -4254,35 +4501,47 @@ execute_dml_stmt(ForeignScanState *node)
 	MYSQL_BIND *mysql_bind_buffer = NULL;
 
 	/*
-	 * Construct array of query parameter values in text format.
+	 * Use PG_TRY block to ensure closing the MySQL statement handler on any error.
 	 */
-	if (numParams > 0)
+	PG_TRY();
 	{
-		mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * numParams);
+		/*
+		 * Construct array of query parameter values in text format.
+		 */
+		if (numParams > 0)
+		{
+			mysql_bind_buffer = (MYSQL_BIND *) palloc0(sizeof(MYSQL_BIND) * numParams);
 
-		process_query_params(econtext,
-							 dmstate->param_flinfo,
-							 dmstate->param_exprs,
-							 values,
-							 &mysql_bind_buffer,
-							 dmstate->param_types);
+			process_query_params(econtext,
+								dmstate->param_flinfo,
+								dmstate->param_exprs,
+								values,
+								&mysql_bind_buffer,
+								dmstate->param_types);
 
-		if (mysql_stmt_bind_param(dmstate->stmt, mysql_bind_buffer) != 0)
-			mysql_stmt_error_print(dmstate->conn, dmstate->stmt, "failed to bind the MySQL query");
+			if (mysql_stmt_bind_param(dmstate->stmt, mysql_bind_buffer) != 0)
+				mysql_error_print(dmstate->conn, "failed to bind the MySQL query");
+		}
+
+		/*
+		 * Finally, execute the query. The result will be placed in the array we
+		 * already bind.
+		 */
+		if (mysql_stmt_execute(dmstate->stmt) != 0)
+			mysql_error_print(dmstate->conn, NULL);
+
+		/* Get the number of rows affected. */
+		dmstate->num_tuples = mysql_stmt_affected_rows(dmstate->stmt);
 	}
+	PG_CATCH();
+	{
+		/* Release MYSQL statement handler if we managed to create one */
+		mysql_close_stmt_handler(dmstate->conn, dmstate->stmt);
 
-	/*
-	 * Finally, execute the query. The result will be placed in the array we
-	 * already bind.
-	 */
-	if (mysql_stmt_execute(dmstate->stmt) != 0)
-		mysql_stmt_error_print(dmstate->conn, dmstate->stmt, "failed to execute the MySQL query");
-
-	/* Get the number of rows affected. */
-	dmstate->num_tuples = mysql_stmt_affected_rows(dmstate->stmt);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
-
-
 
 Datum
 mysql_fdw_version(PG_FUNCTION_ARGS)
@@ -4290,90 +4549,51 @@ mysql_fdw_version(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(CODE_VERSION);
 }
 
-static void
-mysql_error_print(MYSQL * conn)
+void
+mysql_error_print(MYSQL * conn, const char *msg)
 {
 	const char *error_msg = psprintf("%s", mysql_error(conn));
 
-	switch (mysql_errno(conn))
-	{
-		case CR_NO_ERROR:
-			/* Should not happen, though give some message */
-			mysql_release_connection(conn);
-			elog(ERROR, "unexpected error code");
-			break;
-		case CR_OUT_OF_MEMORY:
-		case CR_SERVER_GONE_ERROR:
-		case CR_SERVER_LOST:
-		case CR_UNKNOWN_ERROR:
-			mysql_release_connection(conn);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("failed to execute the MySQL query: \n%s",
-							error_msg)));
-			break;
-		case CR_COMMANDS_OUT_OF_SYNC:
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("failed to execute the MySQL query: \n%s",
-							error_msg)));
-	}
-}
+	if (!msg)
+		msg = "failed to execute the MySQL query";
 
-static void
-mysql_stmt_error_print(MYSQL * conn, MYSQL_STMT * stmt, const char *msg)
-{
-	const char *error_msg = psprintf("%s", mysql_error(conn));
-
-	switch (mysql_stmt_errno(stmt))
-	{
-		case CR_NO_ERROR:
-
-			/*
-			 * Should happen with function push down feature, though give
-			 * error message
-			 */
-			mysql_release_connection(conn);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("%s: \n%s", msg, error_msg)));
-			break;
-		case CR_OUT_OF_MEMORY:
-		case CR_SERVER_GONE_ERROR:
-		case CR_SERVER_LOST:
-		case CR_UNKNOWN_ERROR:
-			mysql_release_connection(conn);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("%s: \n%s", msg, error_msg)));
-			break;
-		case CR_COMMANDS_OUT_OF_SYNC:
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("%s: \n%s", msg, error_msg)));
-			break;
-	}
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			 (error_msg == NULL || *error_msg == 0) ?
+				errmsg("mysql_fdw: %s", msg) :
+				errmsg("mysql_fdw: %s: \n%s", msg, error_msg)));
 }
 
 /*
  * getUpdateTargetAttrs
  * 		Returns the list of attribute numbers of the columns being updated.
  */
-static List *
-getUpdateTargetAttrs(RangeTblEntry *rte)
+#if (PG_VERSION_NUM >= 130010 && PG_VERSION_NUM < 140000) || \
+	(PG_VERSION_NUM >= 140007 && PG_VERSION_NUM < 150000) || \
+	(PG_VERSION_NUM >= 150002)
+static List *getUpdateTargetAttrs(PlannerInfo *root, Index resultRelation)
 {
 	List	   *targetAttrs = NIL;
+	RelOptInfo *rel = find_base_rel(root, resultRelation);
+	Bitmapset  *tmpset = get_rel_all_updated_cols(root, rel);
+	AttrNumber	col;
 
-	/* get all updated columns */
+	int col_idx = -1;
+	while ((col_idx = bms_next_member(tmpset, col_idx)) >= 0)
+	{
+		/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
+		col = col_idx + FirstLowInvalidHeapAttributeNumber;
+#else
+static List *getUpdateTargetAttrs(RangeTblEntry *rte)
+{
+	List	   *targetAttrs = NIL;
 	Bitmapset  *tmpset = bms_union(rte->updatedCols, rte->extraUpdatedCols);
-
 	AttrNumber	col;
 
 	while ((col = bms_first_member(tmpset)) >= 0)
 	{
 		col += FirstLowInvalidHeapAttributeNumber;
+#endif
 		if (col <= InvalidAttrNumber)	/* shouldn't happen */
 			elog(ERROR, "system-column update is not supported");
 
@@ -5102,10 +5322,19 @@ estimate_path_cost_size(PlannerInfo *root,
 			}
 
 			/* Get number of grouping columns and possible number of groups */
+#if PG_VERSION_NUM >= 160000
+			numGroupCols = list_length(root->processed_groupClause);
+#else
 			numGroupCols = list_length(root->parse->groupClause);
+#endif
+
 #if PG_VERSION_NUM >= 140000
 			numGroups = estimate_num_groups(root,
+#if PG_VERSION_NUM >= 160000
+											get_sortgrouplist_exprs(root->processed_groupClause,
+#else
 											get_sortgrouplist_exprs(root->parse->groupClause,
+#endif
 																	fpinfo->grouped_tlist),
 											input_rows, NULL, NULL);
 #else
@@ -5119,7 +5348,11 @@ estimate_path_cost_size(PlannerInfo *root,
 			 * Get the retrieved_rows and rows estimates.  If there are HAVING
 			 * quals, account for their selectivity.
 			 */
+#if PG_VERSION_NUM < 160000
 			if (root->parse->havingQual)
+#else
+			if (root->hasHavingQual)
+#endif
 			{
 				/* Factor in the selectivity of the remotely-checked quals */
 				retrieved_rows =
@@ -5167,7 +5400,11 @@ estimate_path_cost_size(PlannerInfo *root,
 			run_cost += cpu_tuple_cost * numGroups;
 
 			/* Account for the eval cost of HAVING quals, if any */
+#if PG_VERSION_NUM < 160000
 			if (root->parse->havingQual)
+#else
+			if (root->hasHavingQual)
+#endif
 			{
 				QualCost	remote_cost;
 
@@ -5347,7 +5584,7 @@ get_remote_estimate(const char *sql, MYSQL * conn,
 	MYSQL_ROW	row;
 
 	if (mysql_query(conn, sql) != 0)
-		mysql_error_print(conn);
+		mysql_error_print(conn, NULL);
 
 	result = mysql_store_result(conn);
 	if (result)
@@ -5378,6 +5615,7 @@ get_remote_estimate(const char *sql, MYSQL * conn,
 			}
 		}
 		mysql_free_result(result);
+		result = NULL;
 	}
 
 	if (*rows > 0)
@@ -5627,7 +5865,11 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 	 * pathkeys, adjust the costs with that function.  Otherwise, adjust the
 	 * costs by applying the same heuristic as for the scan or join case.
 	 */
+#if PG_VERSION_NUM < 160000	
 	if (!grouping_is_sortable(root->parse->groupClause) ||
+#else
+	if (!grouping_is_sortable(root->processed_groupClause) ||
+#endif
 		!pathkeys_contained_in(pathkeys, root->group_pathkeys))
 	{
 		Path		sort_path;	/* dummy for result of cost_sort */
@@ -5952,7 +6194,11 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		Index		sgref = get_pathtarget_sortgroupref(grouping_target, i);
 		ListCell   *l;
 
-		/* Check whether this expression is part of GROUP BY clause */
+		/*
+		 * Check whether this expression is part of GROUP BY clause.  Note we
+		 * check the whole GROUP BY clause not just processed_groupClause,
+		 * because we will ship all of it, cf. appendGroupByClause.
+		 */
 		if (sgref && get_sortgroupref_clause_noerr(sgref, query->groupClause))
 		{
 			TargetEntry *tle;
@@ -6024,10 +6270,10 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 				 */
 				foreach(l, aggvars)
 				{
-					Expr	   *expr = (Expr *) lfirst(l);
+					Expr	   *aggref = (Expr *) lfirst(l);
 
-					if (IsA(expr, Aggref))
-						tlist = add_to_flat_tlist(tlist, list_make1(expr));
+					if (IsA(aggref, Aggref))
+						tlist = add_to_flat_tlist(tlist, list_make1(aggref));
 				}
 			}
 		}
@@ -6041,8 +6287,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	 */
 	if (havingQual)
 	{
-		ListCell   *lc;
-
 		foreach(lc, (List *) havingQual)
 		{
 			Expr	   *expr = (Expr *) lfirst(lc);
@@ -6059,6 +6303,9 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 									  true,
 									  false,
 									  false,
+#if PG_VERSION_NUM >= 160000
+									  false,
+#endif
 									  root->qual_security_level,
 									  grouped_rel->relids,
 									  NULL,
@@ -6087,7 +6334,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	if (fpinfo->local_conds)
 	{
 		List	   *aggvars = NIL;
-		ListCell   *lc;
 
 		foreach(lc, fpinfo->local_conds)
 		{
@@ -7214,7 +7460,6 @@ mysql_form_whole_row(MySQLWRState * wr_state, Datum *values, bool *nulls)
 						   wr_state->nulls);
 }
 
-
 #if PG_VERSION_NUM >= 140000
 /*
  * Determine batch size for a given foreign table. The option specified for
@@ -7293,3 +7538,79 @@ mysql_remove_backtick_quotes(char *s1)
 }
 
 #endif
+
+/*
+ * ExecForeignDDL is a public function that is called by core code.
+ * It executes DDL command on remote server.
+ *
+ * serverOid: remote server to get connected
+ * rel: relation to be created
+ * operation:
+ * 		0: CREATE command
+ * 		1: DROP command
+ * exists_flag:
+ *		in CREATE DDL: true if `IF NOT EXIST` is specified
+ *		in DROP DDL: true if `IF EXIST` is specified
+ */
+int
+ExecForeignDDL(Oid serverOid,
+			   Relation rel,
+			   int operation,
+			   bool exists_flag)
+{
+	UserMapping *user = NULL;
+	MYSQL	   *conn = NULL;
+	StringInfoData sql;
+	ForeignServer *server;
+	mysql_opt *options = mysql_get_options(serverOid, false);;
+
+	elog(DEBUG1, "mysql_fdw: %s", __func__);
+	if (operation != MYSQL_CMD_CREATE && operation != MYSQL_CMD_DROP)
+	{
+		elog(ERROR, "Only support CREATE/DROP DATASOURCE");
+	}
+
+	initStringInfo(&sql);
+	/* create query */
+	if (operation == MYSQL_CMD_CREATE)
+		mysql_deparse_create_table_sql(&sql, rel, exists_flag);
+	else
+		/* DROP operation */
+		mysql_deparse_drop_table_sql(&sql, rel, exists_flag);
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	user = GetUserMapping(GetUserId(), serverOid);
+	server = GetForeignServer(serverOid);
+	conn = mysql_get_connection(server, user, options);
+
+	/* execute query to create dest table, PQexec */
+	if (mysql_query(conn, sql.data) != 0)
+		mysql_error_print(conn, NULL);
+	pfree(sql.data);
+	return 0;
+}
+
+/*
+ * mysql_close_stmt_handler
+ * 	Close the MySQL statement handler that is created by mysql_stmt_init().
+ */
+static void mysql_close_stmt_handler(MYSQL * conn, MYSQL_STMT *stmt)
+{
+	if (stmt == NULL)
+		return;
+
+	if (mysql_stmt_errno(stmt) == CR_NO_ERROR &&
+		mysql_errno(conn) == ER_DATA_OUT_OF_RANGE)
+	{
+		/*
+		 * The error happens when MySQL returns ER_DATA_OUT_OF_RANGE errorno.
+		 * Can not close stmt and reuse the connection, so release it.
+		 */
+		mysql_release_connection(conn);
+	}
+	else
+		mysql_stmt_close(stmt);
+}

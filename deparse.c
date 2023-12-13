@@ -119,6 +119,11 @@ typedef struct pull_func_clause_context
 	List	   *funclist;
 }			pull_func_clause_context;
 
+typedef struct mysql_default_const_ctx
+{
+	Const *c;
+} mysql_default_const_ctx;
+
 #define REL_ALIAS_PREFIX	"r"
 /* Handy macro to add relation name qualification */
 #define ADD_REL_QUALIFIER(buf, varno)	\
@@ -239,6 +244,7 @@ static void mysql_deparse_func_expr_weight_string(FuncExpr *node, deparse_expr_c
 												  StringInfo buf, char *proname);
 
 static void interval2unit(Datum datum, char **expr, char **unit);
+static char *mysql_print_type_modifier(char *typname, Oid type_oid, int32 typmod, Oid typmodout);
 
 /*
  * Local variables.
@@ -335,6 +341,10 @@ NULL};
 /*
  * MysqlUniqueDateTimeFunction
  * List of unique Date/Time function for MySQL
+ * For date_add, Postgres also supports this function with the
+ * same name but different arguments and return type. So, keep
+ * it in this list to only push down date_add stub function, not
+ * push down built-in date_add.
  */
 static const char *MysqlUniqueDateTimeFunction[] = {
 	"adddate",
@@ -5841,7 +5851,17 @@ mysql_get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 	i = 1;
 	foreach(lc, foreignrel->reltarget->exprs)
 	{
-		if (equal(lfirst(lc), (Node *) node))
+		Var		   *tlvar = (Var *) lfirst(lc);
+
+		/*
+		 * Match reltarget entries only on varno/varattno.  Ideally there
+		 * would be some cross-check on varnullingrels, but it's unclear what
+		 * to do exactly; we don't have enough context to know what that value
+		 * should be.
+		 */
+		if (IsA(tlvar, Var) &&
+			tlvar->varno == node->varno &&
+			tlvar->varattno == node->varattno)
 		{
 			*colno = i;
 			return;
@@ -5921,6 +5941,13 @@ mysql_append_group_by_clause(List *tlist, deparse_expr_cxt *context)
 	 */
 	Assert(!query->groupingSets);
 
+	/*
+	 * We intentionally print query->groupClause not processed_groupClause,
+	 * leaving it to the remote planner to get rid of any redundant GROUP BY
+	 * items again.  This is necessary in case processed_groupClause reduced
+	 * to empty, and in any case the redundancy situation on the remote might
+	 * be different than what we think here.
+	 */
 	foreach(lc, query->groupClause)
 	{
 		SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
@@ -6181,3 +6208,239 @@ mysql_deconstruct_constant_array(Const *node, bool **elem_nulls, Datum **elem_va
 	deconstruct_array(array, *elmtype, elmlen, elmbyval, elmalign,
 					  elem_values, elem_nulls, num_elems);
 }
+
+/*
+ * Add typmod decoration to the basic type name
+ * Modified version of printTypmod
+ */
+static char *
+mysql_print_type_modifier(char *typname, Oid type_oid, int32 typmod, Oid typmodout)
+{
+	char	   *res;
+	bits16		flags;
+	bool 		with_typemod;
+
+	flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+
+	if (!mysql_is_builtin(type_oid))
+		flags |= FORMAT_TYPE_FORCE_QUALIFY;
+	with_typemod = (flags & FORMAT_TYPE_TYPEMOD_GIVEN) != 0 && (typmod >= 0);
+
+	if(!with_typemod)
+		return typname;
+
+	/* Shouldn't be called if typmod is -1 */
+	Assert(typmod >= 0);
+
+	if (typmodout == InvalidOid)
+	{
+		/* Default behavior: just print the integer typmod with parens */
+		res = psprintf("%s(%d)", typname, (int) typmod);
+	}
+	else
+	{
+		/* Use the type-specific typmodout procedure */
+		char	   *tmstr;
+
+		tmstr = DatumGetCString(OidFunctionCall1(typmodout,
+												 Int32GetDatum(typmod)));
+		res = psprintf("%s%s", typname, tmstr);
+	}
+
+	return res;
+}
+
+static bool
+mysql_get_default_const_walker(Node *node, mysql_default_const_ctx * ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Const))
+	{
+		ctx->c = (Const *)node;
+		return true;
+	}
+	return expression_tree_walker(node, mysql_get_default_const_walker, (void *) ctx);
+}
+
+/*
+ * Construct CREATE TABLE statement
+ *
+ */
+void
+mysql_deparse_create_table_sql(StringInfo buf, Relation rel, bool if_not_exist)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleConstr *tupConstr = tupdesc->constr;
+	int			i;
+	char	   *colname;
+	List	   *options;
+	ListCell   *lc;
+	bool		first = true;
+	HeapTuple tuple;
+	Form_pg_type typeform;
+	/* index to the position of current Default Value List */
+	int 		defValIndex = 0;
+
+	appendStringInfoString(buf, "CREATE TABLE ");
+
+	if (if_not_exist)
+		appendStringInfoString(buf, "IF NOT EXISTS ");
+
+	mysql_deparse_relation(buf, rel);
+
+	appendStringInfoString(buf, " (");
+	/* deparse column */
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		bool		is_key = false;
+		char	   *typeStr;
+
+		/* Ignore dropped columns. */
+		if (att->attisdropped)
+			continue;
+
+		tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(att->atttypid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for type %u", att->atttypid);
+
+		typeform = (Form_pg_type) GETSTRUCT(tuple);
+		ReleaseSysCache(tuple);
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		/* Use attribute name or column_name option. */
+		colname = NameStr(att->attname);
+		options = GetForeignColumnOptions(RelationGetRelid(rel), i + 1);
+
+		foreach(lc, options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "column_name") == 0)
+				colname = defGetString(def);
+			else if (strcmp(def->defname, "key") == 0)
+				is_key = defGetBoolean(def);
+		}
+
+		switch(att->atttypid)
+		{
+			case BITOID:
+			case VARBITOID:
+				typeStr = mysql_print_type_modifier("bit", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case BOOLOID:
+				typeStr = "bool";
+				break;
+			case BPCHAROID:
+				typeStr = mysql_print_type_modifier("character", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case DATEOID:
+				typeStr = "date";
+				break;
+			case FLOAT4OID:
+				typeStr = mysql_print_type_modifier("float", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case FLOAT8OID:
+				typeStr = mysql_print_type_modifier("double", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case INT2OID:
+				typeStr = mysql_print_type_modifier("smallint", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case INT4OID:
+				typeStr = mysql_print_type_modifier("int", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case INT8OID:
+				typeStr = mysql_print_type_modifier("bigint", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case NUMERICOID:
+				typeStr = "double";
+				break;
+			case TIMEOID:
+			case TIMETZOID:
+				typeStr = "time";
+				break;
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+				typeStr = "timestamp";
+				break;
+			case VARCHAROID:
+				typeStr = mysql_print_type_modifier("varchar", att->atttypid, att->atttypmod, typeform->typmodout);
+				break;
+			case TEXTARRAYOID:
+			case JSONARRAYOID:
+			case JSONOID:
+				typeStr = "JSON";
+				break;
+			case TEXTOID:
+				typeStr = "text";
+				break;
+			default:
+				typeStr = "text";
+		}
+		appendStringInfo(buf, "%s %s", mysql_quote_identifier(colname, '`'), typeStr);
+
+		/* deparse NOT NULL modifier */
+		if (att->attnotnull)
+			appendStringInfo(buf, " %s", "NOT NULL");
+
+		/* deparse DEFAULT value */
+		if (att->atthasdef)
+		{
+			deparse_expr_cxt defValueCtx;
+			bool		typIsVarlena;
+			char		*extval;
+			Oid			typoutput;
+			Const *cnode;
+			mysql_default_const_ctx ctx;
+			Node	    *node = (Node *) stringToNode(tupConstr->defval[defValIndex].adbin);
+
+			ctx.c = NULL;
+			defValueCtx.can_convert_time = false;
+			defValueCtx.can_convert_unit_arg = false;
+			defValueCtx.is_not_add_array = false;
+			defValueCtx.buf = buf;
+			appendStringInfoString(buf, " DEFAULT ");
+
+
+			mysql_get_default_const_walker(node, &ctx);
+			cnode = ctx.c;
+			if (cnode == NULL)
+				elog(ERROR, "Default value of %s is not supported", colname);
+
+			if (cnode->consttype == TEXTARRAYOID ||
+				cnode->consttype == JSONARRAYOID ||
+				cnode->consttype == JSONOID)
+			{
+
+				getTypeOutputInfo(cnode->consttype, &typoutput, &typIsVarlena);
+				extval = OidOutputFunctionCall(typoutput, cnode->constvalue);
+				mysql_deparse_string_literal(buf, extval);
+			} else
+				mysql_deparse_const(cnode, &defValueCtx);
+
+			defValIndex ++;
+		}
+
+		if (is_key)
+			appendStringInfo(buf, " %s", "PRIMARY KEY");
+	}
+	appendStringInfoString(buf, ");");
+}
+
+/*
+ * Construct DROP TABLE statement
+ *
+ */
+void
+mysql_deparse_drop_table_sql(StringInfo buf, Relation rel, bool exists_flag)
+{
+	appendStringInfo(buf, "DROP TABLE %s", exists_flag ? "IF EXISTS " : "");
+	mysql_deparse_relation(buf, rel);
+	appendStringInfoString(buf, ";");
+}
+

@@ -36,6 +36,7 @@
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/lsyscache.h"
+#include "utils/guc.h"
 #include "utils/syscache.h"
 
 #define DATE_MYSQL_PG(x, y) \
@@ -127,15 +128,15 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 
 					sprintf(str, "%s", dec_bin(value, 64));
 				}
-				
+
 				/*
 				 * pgtypmod records type-specific data supplied at table creation time.
 				 * BIT(8)                         -> pgtypmod = 8
 				 * VARCHAR(12)                    -> pgtypmod = 12
-				 *  
+				 *
 				 * The value will generally be -1 for types that do not need typmod.
 				 * BIT_OR, BIT_AND, TEXT, ...     -> pgtypmod = -1
-				 * 
+				 *
 				 * Therefore, remove leading zero until to the pgtymod length.
 				 */
 				while (str[0] == '0')
@@ -149,6 +150,32 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column * column, MYSQL_FIELD 
 
 				valueDatum = CStringGetDatum((char *) str);
 				break;
+			}
+		case TIMESTAMPTZOID:
+			{
+				int			tz;
+				struct pg_tm tm;
+				fsec_t		fsec;
+				TimestampTz tsvalue;
+
+				value_datum = OidFunctionCall3(typeinput,  CStringGetDatum((char *) column->value),
+								   ObjectIdGetDatum(pgtyp),
+								   Int32GetDatum(pgtypmod));
+
+				/*
+				 * Timestamp value from Mysql already in UTC zone, however,
+				 * this time zone does not specify in timestamp value. It make
+				 * timestamptz casting of Postgres does not work well, it treats
+				 * mysql timestamp as local timestamp (timestamp in current
+				 * database time zone). So, calculate the current database's time
+				 * zone offset to adjust the Timestamptz value
+				 */
+				tsvalue = DatumGetTimestampTz(value_datum);
+				timestamp2tm(tsvalue, NULL, &tm, &fsec, NULL, NULL);
+				tz = DetermineTimeZoneOffset(&tm, session_timezone);
+				tsvalue -= tz * USECS_PER_SEC;
+
+				return TimestampTzGetDatum(tsvalue);
 			}
 		default:
 			valueDatum = CStringGetDatum((char *) column->value);

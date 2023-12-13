@@ -24,6 +24,9 @@
 #include "mysql_fdw.h"
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
+#if PG_VERSION_NUM >= 160000
+#include "utils/varlena.h"
+#endif
 
 /*
  * Describes the valid options for objects that use this wrapper.
@@ -107,6 +110,34 @@ mysql_fdw_validator(PG_FUNCTION_ARGS)
 		if (!mysql_is_valid_option(def->defname, catalog))
 		{
 			struct MySQLFdwOption *opt;
+#if PG_VERSION_NUM >= 160000
+			/*
+			 * Unknown option specified, complain about it. Provide a hint
+			 * with a valid option that looks similar, if there is one.
+			 */
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
+
+			initClosestMatch(&match_state, def->defname, 4);
+			for (opt = valid_options; opt->optname; opt++)
+			{
+				if (catalog == opt->optcontext)
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->optname);
+				}
+			}
+
+			closest_match = getClosestMatch(&match_state);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", def->defname),
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
+#else
 			StringInfoData buf;
 
 			/*
@@ -127,6 +158,7 @@ mysql_fdw_validator(PG_FUNCTION_ARGS)
 					 buf.len > 0 ?
 					 errhint("Valid options in this context are: %s", buf.data) :
 					 errhint("There are no valid options in this context.")));
+#endif
 		}
 
 		/* Validate fetch_size option value */
